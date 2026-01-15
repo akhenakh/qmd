@@ -8,14 +8,14 @@ import (
 	"time"
 )
 
-type Client struct {
+type HTTPClient struct {
 	BaseURL    string
 	Model      string
 	HTTPClient *http.Client
 }
 
-func NewClient(baseURL, model string) *Client {
-	return &Client{
+func NewHTTPClient(baseURL, model string) *HTTPClient {
+	return &HTTPClient{
 		BaseURL: baseURL,
 		Model:   model,
 		HTTPClient: &http.Client{
@@ -34,7 +34,7 @@ type EmbedResponse struct {
 	Embedding []float32 `json:"embedding"`
 }
 
-func (c *Client) Embed(text string, isQuery bool) ([]float32, error) {
+func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 	// Simple Nomic/Gemma formatting logic
 	prefix := "search_document: "
 	if isQuery {
@@ -68,4 +68,9 @@ func (c *Client) Embed(text string, isQuery bool) ([]float32, error) {
 	}
 
 	return result.Embedding, nil
+}
+
+func (c *HTTPClient) Close() error {
+	// HTTP client doesn't need specific cleanup
+	return nil
 }

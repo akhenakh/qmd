@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/akhenakh/qmd/internal/util"
@@ -21,6 +23,11 @@ func NewStore() (*Store, error) {
 	sqlite_vec.Auto() // Load sqlite-vec extension
 
 	cacheDir, _ := os.UserCacheDir()
+	// Allow overriding cache dir via env for testing
+	if envCache := os.Getenv("XDG_CACHE_HOME"); envCache != "" {
+		cacheDir = envCache
+	}
+
 	dbPath := filepath.Join(cacheDir, "qmd", "index.sqlite")
 
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
@@ -32,6 +39,7 @@ func NewStore() (*Store, error) {
 		return nil, err
 	}
 
+	// WAL mode for concurrency
 	if _, err := db.Exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;"); err != nil {
 		return nil, err
 	}
@@ -62,11 +70,13 @@ func (s *Store) initSchema() error {
 			UNIQUE(collection, path)
 		)`,
 		// FTS5 Table
+		// Note: tokenize='porter unicode61' is standard.
+		// If Porter fails in some builds, 'unicode61' alone is a safe fallback.
 		`CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 			filepath, title, body,
 			tokenize='porter unicode61'
 		)`,
-		// Triggers for FTS
+		// Triggers for FTS sync
 		`CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
 		 BEGIN
 			INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -84,7 +94,7 @@ func (s *Store) initSchema() error {
 			SELECT new.id, new.collection || '/' || new.path, new.title, 
 			(SELECT doc FROM content WHERE hash = new.hash);
 		 END`,
-		// Vector Table (768 dim for Nomic/Gemma)
+		// Vector Table
 		`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
 			hash_seq TEXT PRIMARY KEY,
 			embedding float[768] distance_metric=cosine
@@ -115,13 +125,11 @@ func (s *Store) IndexDocument(colName, path, content string) error {
 	}
 	defer tx.Rollback()
 
-	// Insert Content
 	_, err = tx.Exec(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`, hash, content, now)
 	if err != nil {
 		return err
 	}
 
-	// Upsert Document
 	_, err = tx.Exec(`
 		INSERT INTO documents (collection, path, title, hash, modified_at, active)
 		VALUES (?, ?, ?, ?, ?, 1)
@@ -140,22 +148,31 @@ func (s *Store) IndexDocument(colName, path, content string) error {
 
 type SearchResult struct {
 	DocID    int64
-	Filepath string // Format: collection/path
+	Filepath string
 	Title    string
 	Snippet  string
 	Score    float64
+	Matches  []string
 }
 
-func (s *Store) SearchFTS(query string, limit int) ([]SearchResult, error) {
-	// Simple query formatting for FTS5
-	ftsQuery := fmt.Sprintf(`"%s"*`, query)
+func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll bool) ([]SearchResult, error) {
+	// Robust FTS5 query construction
+	query = strings.TrimSpace(query)
+	// Remove double quotes to prevent syntax errors in construction
+	cleanQuery := strings.ReplaceAll(query, "\"", "")
+
+	// Use Phrase Prefix search: "query"*
+	// This works reliably with Porter stemmer for both complete words ("architecture")
+	// and partial words ("archi"), as well as phrases ("project al").
+	ftsQuery := fmt.Sprintf(`"%s"*`, cleanQuery)
 
 	rows, err := s.DB.Query(`
 		SELECT 
 			rowid, 
 			filepath, 
 			title, 
-			snippet(documents_fts, 2, '<b>', '</b>', '...', 10) as snip, 
+			body,
+			offsets(documents_fts),
 			bm25(documents_fts) as rank
 		FROM documents_fts 
 		WHERE documents_fts MATCH ? 
@@ -169,12 +186,112 @@ func (s *Store) SearchFTS(query string, limit int) ([]SearchResult, error) {
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &r.Snippet, &r.Score); err != nil {
+		var body string
+		var offsets string
+
+		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &body, &offsets, &r.Score); err != nil {
 			return nil, err
 		}
+
+		r.Matches = extractMatches(body, offsets, contextLines, findAll)
+
+		if len(r.Matches) == 0 {
+			// Fallback snippet if matches were in title or path, not body
+			// Or if context extraction failed for some reason
+			if len(body) > 200 {
+				r.Snippet = body[:200] + "..."
+			} else {
+				r.Snippet = body
+			}
+		} else {
+			r.Snippet = r.Matches[0]
+		}
+
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func extractMatches(body string, offsetsStr string, n int, findAll bool) []string {
+	parts := strings.Fields(offsetsStr)
+	// FTS5 offsets: colNum, termNum, byteOffset, size
+
+	type match struct {
+		start int
+		end   int
+	}
+	var matches []match
+
+	for i := 0; i < len(parts); i += 4 {
+		col, _ := strconv.Atoi(parts[i])
+
+		// 0=filepath, 1=title, 2=body
+		if col != 2 {
+			continue
+		}
+
+		offset, _ := strconv.Atoi(parts[i+2])
+		size, _ := strconv.Atoi(parts[i+3])
+		matches = append(matches, match{start: offset, end: offset + size})
+
+		if !findAll && len(matches) > 0 {
+			break
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil
+	}
+
+	lines := strings.Split(body, "\n")
+
+	// Pre-calculate line start byte offsets
+	lineOffsets := make([]int, len(lines)+1)
+	currentOffset := 0
+	for i, line := range lines {
+		lineOffsets[i] = currentOffset
+		currentOffset += len(line) + 1 // +1 for newline
+	}
+	lineOffsets[len(lines)] = currentOffset
+
+	var results []string
+
+	for _, m := range matches {
+		// Identify line number
+		lineIdx := 0
+		for i := 0; i < len(lines); i++ {
+			// Check if match start is within this line's range
+			if m.start >= lineOffsets[i] && m.start < lineOffsets[i+1] {
+				lineIdx = i
+				break
+			}
+		}
+
+		startLine := max(lineIdx-n, 0)
+		endLine := lineIdx + n
+		if endLine >= len(lines) {
+			endLine = len(lines) - 1
+		}
+
+		var sb strings.Builder
+		for i := startLine; i <= endLine; i++ {
+			prefix := "   "
+			if i == lineIdx {
+				prefix = "-> "
+			}
+			sb.WriteString(fmt.Sprintf("%s%s\n", prefix, lines[i]))
+		}
+		results = append(results, strings.TrimRight(sb.String(), "\n"))
+	}
+
+	return results
 }
 
 func (s *Store) SaveEmbedding(hash string, seq int, vec []float32) error {
@@ -185,7 +302,6 @@ func (s *Store) SaveEmbedding(hash string, seq int, vec []float32) error {
 
 	key := fmt.Sprintf("%s_%d", hash, seq)
 
-	// Transaction
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
@@ -236,7 +352,7 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Snippet); err != nil {
 			return nil, err
 		}
-		r.Score = 1.0 - r.Score // Convert distance to similarity
+		r.Score = 1.0 - r.Score
 		results = append(results, r)
 	}
 	return results, nil
@@ -266,7 +382,6 @@ func (s *Store) GetPendingEmbeddings() (map[string]string, error) {
 	return res, nil
 }
 
-// GetDocument retrieves the content of a document by collection and path.
 func (s *Store) GetDocument(collection, path string) (string, error) {
 	var content string
 	err := s.DB.QueryRow(`

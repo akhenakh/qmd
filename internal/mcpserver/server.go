@@ -14,11 +14,11 @@ import (
 
 type Server struct {
 	store *store.Store
-	llm   *llm.Client
+	llm   llm.Embedder
 	mcp   *server.MCPServer
 }
 
-func NewServer(s *store.Store, l *llm.Client) *Server {
+func NewServer(s *store.Store, l llm.Embedder) *Server {
 	mcpServer := server.NewMCPServer(
 		"qmd",
 		"1.0.0",
@@ -48,14 +48,19 @@ func (s *Server) registerTools() {
 	searchTool := mcp.NewTool("search",
 		mcp.WithDescription("Full text search using BM25. Use this for specific keywords."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
-		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
+		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of documents to return")),
+		mcp.WithNumber("context_lines", mcp.DefaultNumber(1), mcp.Description("Number of lines to show before and after a match")),
+		mcp.WithBoolean("find_all", mcp.DefaultBool(false), mcp.Description("If true, returns all matches in a file instead of just the first one")),
 	)
 
 	s.mcp.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, _ := request.RequireString("query")
 		limit := request.GetInt("limit", 10)
+		contextLines := request.GetInt("context_lines", 1)
+		findAll := request.GetBool("find_all", false)
 
-		results, err := s.store.SearchFTS(query, limit)
+		// Fixed: Passing all 4 arguments to SearchFTS
+		results, err := s.store.SearchFTS(query, limit, contextLines, findAll)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 		}
@@ -63,7 +68,15 @@ func (s *Server) registerTools() {
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
 		for _, r := range results {
-			sb.WriteString(fmt.Sprintf("## %s\n%s\n\n", r.Filepath, r.Snippet))
+			sb.WriteString(fmt.Sprintf("## %s\n", r.Filepath))
+			if len(r.Matches) > 0 {
+				for _, match := range r.Matches {
+					sb.WriteString(fmt.Sprintf("%s\n...\n", match))
+				}
+			} else {
+				sb.WriteString(fmt.Sprintf("%s\n", r.Snippet))
+			}
+			sb.WriteString("\n")
 		}
 
 		return mcp.NewToolResultText(sb.String()), nil
