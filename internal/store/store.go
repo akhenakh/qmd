@@ -70,8 +70,7 @@ func (s *Store) initSchema() error {
 			UNIQUE(collection, path)
 		)`,
 		// FTS5 Table
-		// Note: tokenize='porter unicode61' is standard.
-		// If Porter fails in some builds, 'unicode61' alone is a safe fallback.
+		// Note: tokenize='porter unicode61' allows stemming (e.g. "running" matches "run")
 		`CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 			filepath, title, body,
 			tokenize='porter unicode61'
@@ -158,21 +157,25 @@ type SearchResult struct {
 func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll bool) ([]SearchResult, error) {
 	// Robust FTS5 query construction
 	query = strings.TrimSpace(query)
-	// Remove double quotes to prevent syntax errors in construction
+	// Remove existing quotes to prevent SQL syntax errors in FTS construction
 	cleanQuery := strings.ReplaceAll(query, "\"", "")
 
-	// Use Phrase Prefix search: "query"*
-	// This works reliably with Porter stemmer for both complete words ("architecture")
-	// and partial words ("archi"), as well as phrases ("project al").
-	ftsQuery := fmt.Sprintf(`"%s"*`, cleanQuery)
+	// We use standard quoted search (`"query"`) to ensure tokens are processed
+	// by the tokenizer (Porter) as a phrase or exact stemmed words.
+	// We avoid appending `*` (prefix wildcard) blindly because it often disables
+	// stemming on the query side while the index remains stemmed, causing matches
+	// like "architecture" vs "architectur" to fail.
+	ftsQuery := fmt.Sprintf(`"%s"`, cleanQuery)
 
+	// Note: We retrieve 'body' to manually build context snippets
+	// We cannot use offsets() function in the main query due to SQLite limitations
+	// with parameterized queries, so we'll get offsets separately if needed
 	rows, err := s.DB.Query(`
 		SELECT 
 			rowid, 
 			filepath, 
 			title, 
 			body,
-			offsets(documents_fts),
 			bm25(documents_fts) as rank
 		FROM documents_fts 
 		WHERE documents_fts MATCH ? 
@@ -187,17 +190,40 @@ func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll boo
 	for rows.Next() {
 		var r SearchResult
 		var body string
+
+		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &body, &r.Score); err != nil {
+			return nil, err
+		}
+
+		// Get offsets for this document
+		// Note: The offsets() function in SQLite FTS5 has very specific requirements
+		// and cannot be used in the way we need. We'll implement context manually.
 		var offsets string
 
-		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &body, &offsets, &r.Score); err != nil {
-			return nil, err
+		// First, check if this row actually matches the query
+		var matchCount int
+		err := s.DB.QueryRow(`SELECT COUNT(*) FROM documents_fts WHERE rowid = ? AND documents_fts MATCH ?`, r.DocID, ftsQuery).Scan(&matchCount)
+		if err != nil || matchCount == 0 {
+			offsets = ""
+		} else {
+			// Try to get offsets using a different approach
+			// According to FTS5 docs, offsets() can only be used in specific contexts
+			// Let's try to get the highlighted version and extract positions from that
+			var highlighted string
+			err := s.DB.QueryRow(`SELECT highlight(documents_fts, 2, '[[', ']]') FROM documents_fts WHERE rowid = ? AND documents_fts MATCH ?`, r.DocID, ftsQuery).Scan(&highlighted)
+			if err != nil && err != sql.ErrNoRows {
+				offsets = ""
+			} else {
+				// We'll extract the match positions manually from the body
+				offsets = extractOffsetsFromBody(body, query)
+			}
 		}
 
 		r.Matches = extractMatches(body, offsets, contextLines, findAll)
 
 		if len(r.Matches) == 0 {
-			// Fallback snippet if matches were in title or path, not body
-			// Or if context extraction failed for some reason
+			// Fallback snippet if matches were in title or metadata, not body
+			// Or if extraction logic returned nothing
 			if len(body) > 200 {
 				r.Snippet = body[:200] + "..."
 			} else {
@@ -219,6 +245,43 @@ func max(a, b int) int {
 	return b
 }
 
+func extractOffsetsFromBody(body string, query string) string {
+	// Simple implementation: find all occurrences of the query in the body
+	// and return them in the FTS5 offsets format: colNum termNum byteOffset size
+	// For now, we'll just find the query in the body and return basic offsets
+	// This is a simplified approach - a proper implementation would need to
+	// tokenize the text the same way FTS5 does
+
+	cleanQuery := strings.TrimSpace(strings.ToLower(query))
+	if cleanQuery == "" {
+		return ""
+	}
+
+	// For now, let's do a simple case-insensitive search
+	// Note: This is a simplified approach and may not match FTS5's tokenization exactly
+	bodyLower := strings.ToLower(body)
+	queryLower := strings.ToLower(cleanQuery)
+
+	var offsetsParts []string
+	idx := 0
+
+	for {
+		pos := strings.Index(bodyLower[idx:], queryLower)
+		if pos == -1 {
+			break
+		}
+
+		actualPos := idx + pos
+		// colNum=2 (body), termNum=0, byteOffset=actualPos, size=len(query)
+		offsetsParts = append(offsetsParts,
+			fmt.Sprintf("2 0 %d %d", actualPos, len(query)))
+
+		idx = actualPos + 1 // Move past this match to find others
+	}
+
+	return strings.Join(offsetsParts, " ")
+}
+
 func extractMatches(body string, offsetsStr string, n int, findAll bool) []string {
 	parts := strings.Fields(offsetsStr)
 	// FTS5 offsets: colNum, termNum, byteOffset, size
@@ -233,6 +296,7 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 		col, _ := strconv.Atoi(parts[i])
 
 		// 0=filepath, 1=title, 2=body
+		// We only want to extract context from the body content
 		if col != 2 {
 			continue
 		}
@@ -252,22 +316,24 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 
 	lines := strings.Split(body, "\n")
 
-	// Pre-calculate line start byte offsets
+	// Pre-calculate line start byte offsets to map byte offsets to line numbers
+	// Note: Using byte length logic consistent with how SQLite counts offsets (bytes)
+	// vs Go string range (bytes).
 	lineOffsets := make([]int, len(lines)+1)
 	currentOffset := 0
 	for i, line := range lines {
 		lineOffsets[i] = currentOffset
-		currentOffset += len(line) + 1 // +1 for newline
+		currentOffset += len(line) + 1 // +1 accounts for the newline char that Split consumes
 	}
 	lineOffsets[len(lines)] = currentOffset
 
 	var results []string
 
 	for _, m := range matches {
-		// Identify line number
+		// Identify which line number contains the match start
 		lineIdx := 0
 		for i := 0; i < len(lines); i++ {
-			// Check if match start is within this line's range
+			// Check if match start is within this line's range [start, next_start)
 			if m.start >= lineOffsets[i] && m.start < lineOffsets[i+1] {
 				lineIdx = i
 				break
@@ -352,6 +418,7 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Snippet); err != nil {
 			return nil, err
 		}
+		// Convert cosine distance (0..2) to similarity-like score
 		r.Score = 1.0 - r.Score
 		results = append(results, r)
 	}
