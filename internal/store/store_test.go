@@ -12,24 +12,22 @@ import (
 // setupTestEnv configures a temporary cache directory so NewStore
 // creates an isolated DB for testing purposes.
 func setupTestEnv(t *testing.T) (*store.Store, func()) {
-	// Create a temporary directory
 	tempDir, err := os.MkdirTemp("", "qmd_test_*")
 	require.NoError(t, err)
 
-	// Mock UserCacheDir by setting XDG_CACHE_HOME (Linux/Mac) and LocalAppData (Windows)
 	originalCacheEnv := os.Getenv("XDG_CACHE_HOME")
 	originalWinEnv := os.Getenv("LocalAppData")
 
 	os.Setenv("XDG_CACHE_HOME", tempDir)
 	os.Setenv("LocalAppData", tempDir)
 
-	s, err := store.NewStore()
+	// Pass dimensions to NewStore (768 for test)
+	s, err := store.NewStore(768)
 	require.NoError(t, err)
 
 	cleanup := func() {
 		s.DB.Close()
 		os.RemoveAll(tempDir)
-		// Restore env
 		os.Setenv("XDG_CACHE_HOME", originalCacheEnv)
 		os.Setenv("LocalAppData", originalWinEnv)
 	}

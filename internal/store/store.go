@@ -19,7 +19,7 @@ type Store struct {
 	DB *sql.DB
 }
 
-func NewStore() (*Store, error) {
+func NewStore(embedDim int) (*Store, error) {
 	sqlite_vec.Auto() // Load sqlite-vec extension
 
 	cacheDir, _ := os.UserCacheDir()
@@ -45,13 +45,19 @@ func NewStore() (*Store, error) {
 	}
 
 	s := &Store{DB: db}
-	if err := s.initSchema(); err != nil {
+	if err := s.initSchema(embedDim); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) initSchema() error {
+func (s *Store) initSchema(embedDim int) error {
+	// Dynamically create the vector table with the correct dimensions
+	vectorTableSQL := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
+		hash_seq TEXT PRIMARY KEY,
+		embedding float[%d] distance_metric=cosine
+	)`, embedDim)
+
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS content (
 			hash TEXT PRIMARY KEY,
@@ -70,12 +76,11 @@ func (s *Store) initSchema() error {
 			UNIQUE(collection, path)
 		)`,
 		// FTS5 Table
-		// Note: tokenize='porter unicode61' allows stemming (e.g. "running" matches "run")
 		`CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 			filepath, title, body,
 			tokenize='porter unicode61'
 		)`,
-		// Triggers for FTS sync
+		// Triggers
 		`CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
 		 BEGIN
 			INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -93,11 +98,8 @@ func (s *Store) initSchema() error {
 			SELECT new.id, new.collection || '/' || new.path, new.title, 
 			(SELECT doc FROM content WHERE hash = new.hash);
 		 END`,
-		// Vector Table
-		`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
-			hash_seq TEXT PRIMARY KEY,
-			embedding float[768] distance_metric=cosine
-		)`,
+		// Vector Tables
+		vectorTableSQL,
 		`CREATE TABLE IF NOT EXISTS content_vectors (
 			hash TEXT NOT NULL,
 			seq INTEGER NOT NULL DEFAULT 0,
@@ -365,25 +367,20 @@ func (s *Store) SaveEmbedding(hash string, seq int, vec []float32) error {
 	if err != nil {
 		return err
 	}
-
 	key := fmt.Sprintf("%s_%d", hash, seq)
-
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
 	_, err = tx.Exec(`INSERT OR IGNORE INTO content_vectors (hash, seq) VALUES (?, ?)`, hash, seq)
 	if err != nil {
 		return err
 	}
-
 	_, err = tx.Exec(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`, key, blob)
 	if err != nil {
 		return err
 	}
-
 	return tx.Commit()
 }
 
@@ -418,7 +415,6 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Snippet); err != nil {
 			return nil, err
 		}
-		// Convert cosine distance (0..2) to similarity-like score
 		r.Score = 1.0 - r.Score
 		results = append(results, r)
 	}
@@ -480,16 +476,13 @@ func (s *Store) GetStats() (*Stats, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	err = s.DB.QueryRow("SELECT COUNT(DISTINCT collection) FROM documents WHERE active=1").Scan(&stats.Collections)
 	if err != nil {
 		return nil, err
 	}
-
 	err = s.DB.QueryRow("SELECT COUNT(*) FROM vectors_vec").Scan(&stats.Embeddings)
 	if err != nil {
 		return nil, err
 	}
-
 	return stats, nil
 }

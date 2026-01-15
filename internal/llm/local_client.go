@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
@@ -13,6 +15,8 @@ type LocalClient struct {
 	LibPath   string
 	Context   llama.Context
 	Model     llama.Model
+	UseEncode bool
+	MaxTokens int
 }
 
 func NewLocalClient(modelFile, libPath string) (*LocalClient, error) {
@@ -33,13 +37,53 @@ func NewLocalClient(modelFile, libPath string) (*LocalClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to load model: %v", err)
 	}
-	// Note: yzma uses typed handles, but checking for 0 is still valid for uintptr-based types if they are defined as such.
-	// However, the provided error check above is usually sufficient.
 
-	// Initialize Context
+	// Determine if we should use Encode (BERT/Nomic) or Decode (Llama)
+	useEncode := false
+
+	// Fetch architecture metadata
+	val, ok := llama.ModelMetaValStr(model, "general.architecture")
+	if ok {
+		if strings.Contains(val, "bert") {
+			useEncode = true
+		}
+	} else {
+		// Fallback: checks filename if metadata lookup fails
+		lowerName := strings.ToLower(modelFile)
+		if strings.Contains(lowerName, "bert") || strings.Contains(lowerName, "nomic-embed") {
+			useEncode = true
+		}
+	}
+
+	// Determine max context length to configure batch sizes correctly
+	// Nomic Embed v1.5 typically has 2048 context
+	maxTokens := 2048
+
+	// Try to read context length from metadata
+	if useEncode {
+		if sVal, ok := llama.ModelMetaValStr(model, "nomic-bert.context_length"); ok {
+			if v, err := strconv.Atoi(sVal); err == nil && v > 0 {
+				maxTokens = v
+			}
+		}
+	} else {
+		if sVal, ok := llama.ModelMetaValStr(model, "llama.context_length"); ok {
+			if v, err := strconv.Atoi(sVal); err == nil && v > 0 {
+				maxTokens = v
+			}
+		} else if sVal, ok := llama.ModelMetaValStr(model, "general.context_length"); ok {
+			if v, err := strconv.Atoi(sVal); err == nil && v > 0 {
+				maxTokens = v
+			}
+		}
+	}
+
+	// Initialize Context with batch sizes matching the context limit
+	// This prevents "encoder requires n_ubatch >= n_tokens" assertion failures
 	ctxParams := llama.ContextDefaultParams()
-	ctxParams.NCtx = 4096 // Default context window
-	// Enable embeddings - Embeddings field is uint8 (bool)
+	ctxParams.NCtx = uint32(maxTokens)
+	ctxParams.NBatch = uint32(maxTokens)
+	ctxParams.NUbatch = uint32(maxTokens)
 	ctxParams.Embeddings = 1
 	ctxParams.PoolingType = llama.PoolingTypeMean
 
@@ -54,6 +98,8 @@ func NewLocalClient(modelFile, libPath string) (*LocalClient, error) {
 		LibPath:   libPath,
 		Model:     model,
 		Context:   lctx,
+		UseEncode: useEncode,
+		MaxTokens: maxTokens,
 	}, nil
 }
 
@@ -70,17 +116,31 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 	// Tokenize (true for add_bos, true for special tokens)
 	tokens := llama.Tokenize(vocab, prompt, true, true)
 
+	// SAFETY: Truncate tokens to MaxTokens to prevent llama.cpp assertion crash.
+	// The assertion `GGML_ASSERT(n_ubatch >= n_tokens)` fails if input is too long.
+	if len(tokens) > c.MaxTokens {
+		// Log warning if needed, but for now silent truncation is standard for embeddings
+		tokens = tokens[:c.MaxTokens]
+	}
+
 	// Create batch
 	batch := llama.BatchGetOne(tokens)
 
-	// Decode
-	// yzma.Decode returns (int32, error) based on the provided definition
-	ret, err := llama.Decode(c.Context, batch)
+	var ret int32
+	var err error
+
+	// Use appropriate processing function based on architecture
+	if c.UseEncode {
+		ret, err = llama.Encode(c.Context, batch)
+	} else {
+		ret, err = llama.Decode(c.Context, batch)
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("llama_decode failed: %w", err)
+		return nil, fmt.Errorf("llama processing failed: %w", err)
 	}
 	if ret != 0 {
-		return nil, fmt.Errorf("llama_decode failed with code %d", ret)
+		return nil, fmt.Errorf("llama processing failed with code %d", ret)
 	}
 
 	// Get Embeddings
@@ -109,7 +169,6 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 }
 
 func (c *LocalClient) Close() error {
-	// Assuming llama.Free takes Context and llama.ModelFree takes Model
 	if c.Context != 0 {
 		llama.Free(c.Context)
 	}

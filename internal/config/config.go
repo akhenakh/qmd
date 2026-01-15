@@ -14,47 +14,73 @@ type Collection struct {
 }
 
 type Config struct {
-	GlobalContext string                `yaml:"global_context"`
-	Collections   map[string]Collection `yaml:"collections"`
+	// LLM / Embedding Settings
+	OllamaURL       string `yaml:"ollama_url"`
+	ModelName       string `yaml:"model_name"`
+	EmbedDimensions int    `yaml:"embed_dimensions"`
+
+	// Local Inference Settings
+	UseLocal       bool   `yaml:"use_local"`
+	LocalModelPath string `yaml:"local_model_path"`
+	LocalLibPath   string `yaml:"local_lib_path"`
+
+	// Chunking Settings
+	ChunkSize    int `yaml:"chunk_size"`
+	ChunkOverlap int `yaml:"chunk_overlap"`
+
+	// Data
+	Collections map[string]Collection `yaml:"collections"`
 }
 
-func GetConfigDir() (string, error) {
+// Default settings
+func Default() *Config {
+	return &Config{
+		OllamaURL:       "http://localhost:11434",
+		ModelName:       "nomic-embed-text",
+		EmbedDimensions: 768,
+		ChunkSize:       1000,
+		ChunkOverlap:    200,
+		Collections:     make(map[string]Collection),
+	}
+}
+
+func GetConfigPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".config", "qmd"), nil
+	return filepath.Join(home, ".config", "qmd.yml"), nil
 }
 
 func Load() (*Config, error) {
-	dir, err := GetConfigDir()
+	path, err := GetConfigPath()
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, "index.yml"))
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &Config{Collections: make(map[string]Collection)}, nil
+		return Default(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	cfg := Default()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
-	if cfg.Collections == nil {
-		cfg.Collections = make(map[string]Collection)
-	}
-	return &cfg, nil
+
+	return cfg, nil
 }
 
 func Save(cfg *Config) error {
-	dir, err := GetConfigDir()
+	path, err := GetConfigPath()
 	if err != nil {
 		return err
 	}
+
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -63,5 +89,5 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "index.yml"), data, 0644)
+	return os.WriteFile(path, data, 0644)
 }
