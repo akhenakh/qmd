@@ -277,6 +277,12 @@ func main() {
 				globalConfig.LocalLibPath = localLibPath
 			}
 
+			// If local mode is active and no explicit model name provided,
+			// use the filename from the path as the model name.
+			if globalConfig.UseLocal && globalConfig.LocalModelPath != "" && !cmd.Flags().Changed("model") {
+				globalConfig.ModelName = filepath.Base(globalConfig.LocalModelPath)
+			}
+
 			// Mark as configured
 			globalConfig.EmbeddingsConfigured = true
 
@@ -383,7 +389,82 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdInfo, cmdEmbed, cmdSearch, cmdVSearch, cmdServer)
+	// --- Hybrid Query Command ---
+	var cmdQuery = &cobra.Command{
+		Use:   "query [query]",
+		Short: "Hybrid search (BM25 + Vector + RRF)",
+		Long:  "Performs a hybrid search combining Full-Text Search and Vector Search, ranking results using Reciprocal Rank Fusion.",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 1. Validation
+			if !globalConfig.EmbeddingsConfigured {
+				log.Fatal("Embeddings not configured. Run 'qmd embed' first.")
+			}
+
+			// 2. Initialize Store & Embedder
+			if globalStore == nil {
+				// Should be initialized by PersistentPreRun, but just in case
+				var err error
+				globalStore, err = store.NewStore(dbPath)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			defer globalStore.DB.Close()
+
+			embedder, err := getEmbedder()
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer embedder.Close()
+
+			query := args[0]
+
+			// 3. Generate Embedding for the query
+			// Note: We perform this synchronously. In a more advanced version with query expansion,
+			// we would generate multiple variations here.
+			fmt.Printf("Analyzing query: %q...\n", query)
+			qVec, err := embedder.Embed(query, true)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			// 4. Perform Hybrid Search
+			results, err := globalStore.SearchHybrid(query, qVec, 10)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			// 5. Output Results
+			if len(results) == 0 {
+				fmt.Println("No results found.")
+				return
+			}
+
+			fmt.Println("\nHybrid Search Results (RRF):")
+			for i, r := range results {
+				// Visual separator
+				fmt.Printf("\n%d. \033[1;36m%s\033[0m (Score: %.4f)\n", i+1, r.Filepath, r.Score)
+				fmt.Printf("   Title: %s\n", r.Title)
+
+				// Prefer showing specific matches if available (from FTS), otherwise snippet
+				if len(r.Matches) > 0 {
+					for _, match := range r.Matches {
+						fmt.Printf("   %s\n", match)
+					}
+				} else {
+					// Clean up newlines for cleaner output
+					snippet := strings.ReplaceAll(r.Snippet, "\n", " ")
+					if len(snippet) > 150 {
+						snippet = snippet[:150] + "..."
+					}
+					fmt.Printf("   %s\n", snippet)
+				}
+			}
+		},
+	}
+
+	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdInfo, cmdEmbed, cmdSearch, cmdVSearch, cmdQuery, cmdServer)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

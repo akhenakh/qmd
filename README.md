@@ -1,32 +1,35 @@
 # qmd 
 
-A heavily inspired Go implementation of **Quick Markdown Search**, originally created by [Tobias Lütke](https://github.com/tobi).
-
-> **Original Project:** [github.com/tobi/qmd](https://github.com/tobi/qmd)
+A heavily inspired Go implementation of **Quick Markdown Search**,  [Quick Markdown Search](https://github.com/tobi/qmd), originally created by [Tobias Lütke](https://github.com/tobi).
 
 `qmd` is a command-line tool for indexing and searching markdown notes.  
-It supports both full-text search (using SQLite FTS5) and semantic vector search.  
+It supports full-text search (BM25), semantic vector search, and hybrid search (RRF).  
 You can generate embeddings using either an **Ollama** server or **Local Inference** (via embedded `llama.cpp` / `yzma`).
 
 ## Features
 
 - **Full-Text Search**: Fast keyword search using BM25 with context extraction.
 - **Vector Search**: Semantic search using embeddings (Ollama or Local).
+- **Hybrid Search**: Combines keyword and semantic search using Reciprocal Rank Fusion (RRF) for highest accuracy.
 - **Smart Splitting**: Uses context-aware Markdown splitting (via LangChainGo) for better embedding quality.
 - **MCP Server**: Exposes search capabilities via the [Model Context Protocol](https://modelcontextprotocol.io), allowing AI assistants (like Claude Desktop) to search your notes.
-- **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default).
-- **Multiple Collections**: Index multiple directories at once.
+- **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default), so that you can point to different db for different purposes.
+
+## Prerequisites
+
+1. **Go 1.25+**
+2. **C Compiler** (gcc or clang) for SQLite extensions.
 
 ## Embeddings
-Using vector search is optional, it is using SQLite FTS5 BM25 if you don't.
-
-### Embeddings Option A: Pointing to Ollama
+Using embeddings is optional, qmd will default to SQLite FTS5 BM25 by default.
+ 
+### Embeddings Option A: Ollama 
 
 Install and run **[Ollama](https://ollama.com/)**.
 
-### Option B: Local Inference
+### Embeddings Option B: Local Inference (Recommended for performance/control)
 
-If you prefer to run the model directly within `qmd` without an external server, you need to fetch lamacpp shared libraries. We use [yzma](https://github.com/hybridgroup/yzma) to manage these, or you can download them manually.
+If you prefer to run the model directly within `qmd` without an external server, you need the `llama.cpp` shared libraries. We use [yzma](https://github.com/hybridgroup/yzma) to manage these, but you can manually download and copy the libraries from `llama.cpp` project.
 
 1. **Install the `yzma` tool:**
    ```bash
@@ -43,6 +46,8 @@ If you prefer to run the model directly within `qmd` without an external server,
 
    # CUDA (NVIDIA GPU)
    yzma install --lib ~/lib/yzma --processor cuda
+   # Vulkan (AMD GPU)
+   yzma install --lib ~/lib/yzma --processor vulkan
    ```
 
 3. **Download an Embedding Model:**
@@ -81,7 +86,7 @@ qmd search "postgres slow"
 
 ### 3. Generate Embeddings
 
-To enable Semantic Search (`vsearch`), you must configure the embedding model and generate vectors. This command saves the configuration to the database for future updates.
+To enable Semantic Search (`vsearch`) and Hybrid Search (`query`), you must configure the embedding model and generate vectors. This command saves the configuration to the database for future updates.
 
 **Using Local Inference (llama.cpp):**
 ```bash
@@ -93,12 +98,17 @@ qmd embed --local --model-path /opt/ml/nomic-embed-text-v1.5.Q8_0.gguf --lib-pat
 qmd embed --url http://localhost:11434 --model nomic-embed-text
 ```
 
-### 4. Semantic Search
+### 4. Search
 
-Once embeddings are generated:
-
+**Semantic Search (Vector only):**
 ```bash
 qmd vsearch "performance issues with database"
+```
+
+**Hybrid Search (Best Quality):**
+Combines keyword matching and semantic understanding.
+```bash
+qmd query "quarterly planning process"
 ```
 
 ## Detailed Usage
@@ -124,7 +134,7 @@ qmd update
 ```
 
 #### `search [query]`
-Standard keyword search.
+Standard keyword search (BM25).
 - `--context N`: Show N lines of context (default 0).
 - `--all`: Show all matches in a file (default false).
 ```bash
@@ -143,6 +153,9 @@ Configures embedding settings and generates vectors for pending documents.
 
 #### `vsearch [query]`
 Performs cosine similarity search against generated embeddings. Requires `embed` to have been run at least once.
+
+#### `query [query]`
+Performs a hybrid search. It runs both Full-Text Search and Vector Search, then combines the results using Reciprocal Rank Fusion (RRF). This often provides better results than either method alone by balancing exact keyword matches with semantic meaning.
 
 #### `info`
 Displays current configuration, indexed collections, and database statistics.

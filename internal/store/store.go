@@ -598,3 +598,34 @@ func (s *Store) GetStats() (*Stats, error) {
 	}
 	return stats, nil
 }
+
+// SearchHybrid performs both FTS and Vector search and combines them using RRF.
+// It fetches more candidates (limit * 2) from each source to ensure good intersection.
+func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int) ([]SearchResult, error) {
+	// 1. Run searches in parallel (mocked here by sequential for simplicity, or use goroutines)
+	// We ask for more results (2x limit) from individual engines to improve fusion quality
+	candidateLimit := limit * 2
+
+	// FTS Search
+	// We request 1 line of context by default for snippets
+	ftsResults, err := s.SearchFTS(textQuery, candidateLimit, 1, false)
+	if err != nil {
+		return nil, fmt.Errorf("FTS search failed: %w", err)
+	}
+
+	// Vector Search
+	vecResults, err := s.SearchVec(queryVec, candidateLimit)
+	if err != nil {
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	}
+
+	// 2. Fuse Results
+	fused := ReciprocalRankFusion(ftsResults, vecResults)
+
+	// 3. Apply final limit
+	if len(fused) > limit {
+		fused = fused[:limit]
+	}
+
+	return fused, nil
+}
