@@ -17,207 +17,300 @@ import (
 )
 
 var (
-	// HTTP flags
+	// Flags
+	dbPath    string
 	ollamaURL string
 	modelName string
 	embedDim  int
 
-	// Local flags
 	localMode      bool
 	localModelPath string
 	localLibPath   string
 
-	// Search flags
 	contextLines int
 	findAll      bool
 
-	// App Config
-	cfg *config.Config
+	// Global instances
+	globalStore  *store.Store
+	globalConfig *config.Config
 )
 
-// Helper to get the appropriate embedder based on final config
 func getEmbedder() (llm.Embedder, error) {
-	// Check if local mode is enabled either via config or flag (merged into cfg.UseLocal)
-	if cfg.UseLocal {
-		if cfg.LocalModelPath == "" {
+	if globalConfig.UseLocal {
+		if globalConfig.LocalModelPath == "" {
 			return nil, fmt.Errorf("local mode enabled but local_model_path is missing")
 		}
-
-		// Fallback for LibPath to Env Var if config/flag is empty
-		if cfg.LocalLibPath == "" && os.Getenv("YZMA_LIB") != "" {
-			cfg.LocalLibPath = os.Getenv("YZMA_LIB")
+		if globalConfig.LocalLibPath == "" && os.Getenv("YZMA_LIB") != "" {
+			globalConfig.LocalLibPath = os.Getenv("YZMA_LIB")
 		}
-
-		if cfg.LocalLibPath == "" {
-			return nil, fmt.Errorf("local mode enabled but local_lib_path is missing (and YZMA_LIB env var not set)")
+		if globalConfig.LocalLibPath == "" {
+			return nil, fmt.Errorf("local mode enabled but local_lib_path is missing")
 		}
+		fmt.Printf("Loading local model: %s\n", globalConfig.LocalModelPath)
+		return llm.NewLocalClient(globalConfig.LocalModelPath, globalConfig.LocalLibPath)
+	}
+	return llm.NewHTTPClient(globalConfig.OllamaURL, globalConfig.ModelName), nil
+}
 
-		fmt.Printf("Loading local model: %s\n", cfg.LocalModelPath)
-		return llm.NewLocalClient(cfg.LocalModelPath, cfg.LocalLibPath)
+func generateEmbeddings() {
+	embedder, err := getEmbedder()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer embedder.Close()
+
+	pending, err := globalStore.GetPendingEmbeddings()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(pending) == 0 {
+		fmt.Println("No pending embeddings.")
+		return
 	}
 
-	return llm.NewHTTPClient(cfg.OllamaURL, cfg.ModelName), nil
+	fmt.Printf("Generating embeddings for %d documents (Dim: %d)...\n", len(pending), globalConfig.EmbedDimensions)
+
+	splitter := textsplitter.NewMarkdownTextSplitter(
+		textsplitter.WithChunkSize(globalConfig.ChunkSize),
+		textsplitter.WithChunkOverlap(globalConfig.ChunkOverlap),
+	)
+
+	for hash, content := range pending {
+		chunks, err := splitter.SplitText(content)
+		if err != nil {
+			log.Printf("Error splitting: %v", err)
+			continue
+		}
+
+		for i, chunk := range chunks {
+			vec, err := embedder.Embed(chunk, false)
+			if err != nil {
+				log.Printf("Error embedding: %v", err)
+				continue
+			}
+			if err := globalStore.SaveEmbedding(hash, i, vec); err != nil {
+				log.Fatal(err)
+			}
+		}
+		fmt.Print(".")
+	}
+	fmt.Println("\nDone.")
 }
 
 func main() {
-	// 1. Load config at startup
-	var err error
-	cfg, err = config.Load()
-	if err != nil {
-		log.Printf("Warning: Could not load config: %v", err)
-		cfg = config.Default()
-	}
-
 	var rootCmd = &cobra.Command{
 		Use: "qmd",
-		// 2. PersistentPreRun executes after flags are parsed but before the command runs.
-		// We use this to merge CLI flags into the Config object.
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			// HTTP / General Overrides
-			if ollamaURL != "" {
-				cfg.OllamaURL = ollamaURL
-			}
-			if modelName != "" {
-				cfg.ModelName = modelName
-			}
-			if embedDim != 0 {
-				cfg.EmbedDimensions = embedDim
+			var err error
+
+			// Open Store
+			globalStore, err = store.NewStore(dbPath)
+			if err != nil {
+				log.Fatalf("Failed to open store at %s: %v", dbPath, err)
 			}
 
-			// Local Inference Overrides
-			// Only toggle UseLocal if the flag was explicitly set (true).
-			// If flag is false (default), respect the config file.
-			if cmd.Flags().Changed("local") {
-				cfg.UseLocal = localMode
+			// Load Config
+			globalConfig, err = globalStore.LoadConfig()
+			if err != nil {
+				log.Printf("Warning: Could not load config from DB: %v", err)
+				globalConfig = config.Default()
 			}
 
-			if localModelPath != "" {
-				cfg.LocalModelPath = localModelPath
+			// Ensure Schema for Vectors matches config ONLY IF CONFIGURED
+			if globalConfig.EmbeddingsConfigured {
+				if err := globalStore.EnsureVectorTable(globalConfig.EmbedDimensions); err != nil {
+					log.Fatalf("Failed to ensure vector table: %v", err)
+				}
 			}
-			if localLibPath != "" {
-				cfg.LocalLibPath = localLibPath
+		},
+		PersistentPostRun: func(cmd *cobra.Command, args []string) {
+			if globalStore != nil && globalStore.DB != nil {
+				globalStore.DB.Close()
 			}
 		},
 	}
 
-	// Global flags
-	rootCmd.PersistentFlags().StringVar(&ollamaURL, "url", "", fmt.Sprintf("Ollama API URL (default %s)", cfg.OllamaURL))
-	rootCmd.PersistentFlags().StringVar(&modelName, "model", "", fmt.Sprintf("Embedding model name (default %s)", cfg.ModelName))
-	rootCmd.PersistentFlags().IntVar(&embedDim, "dim", 0, fmt.Sprintf("Embedding vector dimensions (default %d)", cfg.EmbedDimensions))
+	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./qmd.sqlite", "Path to SQLite database")
 
-	// Local inference flags
-	rootCmd.PersistentFlags().BoolVar(&localMode, "local", false, "Use local llama.cpp inference instead of HTTP")
-	rootCmd.PersistentFlags().StringVar(&localModelPath, "model-path", "", "Path to GGUF model file")
-	rootCmd.PersistentFlags().StringVar(&localLibPath, "lib-path", "", "Path to llama.cpp shared library")
-
-	// --- Collection Add ---
-	var cmdAdd = &cobra.Command{
-		Use:   "add [path]",
-		Short: "Add a folder as a collection",
-		Args:  cobra.ExactArgs(1),
+	var cmdInfo = &cobra.Command{
+		Use:   "info",
+		Short: "Show index information and configuration",
 		Run: func(cmd *cobra.Command, args []string) {
-			absPath, _ := filepath.Abs(args[0])
-			name := filepath.Base(absPath)
+			fmt.Println("=== Configuration ===")
+			fmt.Printf("Database Path:    %s\n", globalStore.DBPath)
 
-			cfg.Collections[name] = config.Collection{
-				Path:    absPath,
-				Pattern: "**/*.md",
+			if globalConfig.EmbeddingsConfigured {
+				fmt.Printf("Model Name:       %s\n", globalConfig.ModelName)
+				fmt.Printf("Dimensions:       %d\n", globalConfig.EmbedDimensions)
+				fmt.Printf("Chunk Size:       %d\n", globalConfig.ChunkSize)
+				fmt.Printf("Chunk Overlap:    %d\n", globalConfig.ChunkOverlap)
+
+				if globalConfig.UseLocal {
+					fmt.Println("Mode:             Local (llama.cpp)")
+					fmt.Printf("Local Model:      %s\n", globalConfig.LocalModelPath)
+					fmt.Printf("Local Lib:        %s\n", globalConfig.LocalLibPath)
+				} else {
+					fmt.Println("Mode:             Ollama Server")
+					fmt.Printf("Ollama URL:       %s\n", globalConfig.OllamaURL)
+				}
+			} else {
+				fmt.Println("Embedding:        Not configured (run 'qmd embed' to setup)")
+			}
+			fmt.Println()
+
+			fmt.Println("=== Collections ===")
+			if len(globalConfig.Collections) == 0 {
+				fmt.Println("  (No collections added)")
+			} else {
+				for _, col := range globalConfig.Collections {
+					fmt.Printf("- %s\n  Path: %s\n  Pattern: %s\n", col.Name, col.Path, col.Pattern)
+				}
+			}
+			fmt.Println()
+
+			stats, err := globalStore.GetStats()
+			if err != nil {
+				log.Printf("Error fetching stats: %v", err)
+				return
 			}
 
-			if err := config.Save(cfg); err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("Added collection '%s' at %s\n", name, absPath)
+			fmt.Println("=== Index Stats ===")
+			fmt.Printf("Total Documents:  %d\n", stats.TotalDocuments)
+			fmt.Printf("Vector Count:     %d\n", stats.Embeddings)
 
-			reindex(name, absPath, cfg.EmbedDimensions)
+			if globalConfig.EmbeddingsConfigured && stats.Embeddings > 0 {
+				fmt.Printf("Embeddings:       Present\n")
+			} else if globalConfig.EmbeddingsConfigured {
+				fmt.Printf("Embeddings:       Configured but empty\n")
+			} else {
+				fmt.Println("Embeddings:       Not generated")
+			}
 		},
 	}
 
-	// --- Update/Reindex ---
+	var cmdAdd = &cobra.Command{
+		Use:   "add [path...]",
+		Short: "Add one or more folders as collections",
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			var added []config.Collection
+
+			for _, arg := range args {
+				absPath, err := filepath.Abs(arg)
+				if err != nil {
+					log.Printf("Error resolving path %s: %v", arg, err)
+					continue
+				}
+				name := filepath.Base(absPath)
+
+				// Check if already exists
+				exists := false
+				for _, c := range globalConfig.Collections {
+					if c.Path == absPath {
+						exists = true
+						break
+					}
+				}
+
+				if !exists {
+					newCol := config.Collection{
+						Name:    name,
+						Path:    absPath,
+						Pattern: "**/*.md",
+					}
+					globalConfig.Collections = append(globalConfig.Collections, newCol)
+					added = append(added, newCol)
+					fmt.Printf("Added collection '%s' at %s\n", name, absPath)
+				} else {
+					fmt.Printf("Collection already exists: %s\n", absPath)
+				}
+			}
+
+			if len(added) > 0 {
+				if err := globalStore.SaveConfig(globalConfig); err != nil {
+					log.Fatal(err)
+				}
+				// Reindex newly added collections
+				for _, col := range added {
+					reindex(col.Name, col.Path)
+				}
+			}
+		},
+	}
+
 	var cmdUpdate = &cobra.Command{
 		Use:   "update",
 		Short: "Update index",
 		Run: func(cmd *cobra.Command, args []string) {
-			for name, col := range cfg.Collections {
-				reindex(name, col.Path, cfg.EmbedDimensions)
+			for _, col := range globalConfig.Collections {
+				reindex(col.Name, col.Path)
+			}
+
+			// Only update embeddings if configured
+			if globalConfig.EmbeddingsConfigured {
+				generateEmbeddings()
 			}
 		},
 	}
 
-	// --- Embed ---
 	var cmdEmbed = &cobra.Command{
 		Use:   "embed",
-		Short: "Generate missing embeddings",
+		Short: "Generate missing embeddings (and configure model settings)",
 		Run: func(cmd *cobra.Command, args []string) {
-			s, err := store.NewStore(cfg.EmbedDimensions)
-			if err != nil {
+			// Update config from flags if provided
+			if cmd.Flags().Changed("url") {
+				globalConfig.OllamaURL = ollamaURL
+			}
+			if cmd.Flags().Changed("model") {
+				globalConfig.ModelName = modelName
+			}
+			if cmd.Flags().Changed("dim") {
+				globalConfig.EmbedDimensions = embedDim
+			}
+			if cmd.Flags().Changed("local") {
+				globalConfig.UseLocal = localMode
+			}
+			if cmd.Flags().Changed("model-path") {
+				globalConfig.LocalModelPath = localModelPath
+			}
+			if cmd.Flags().Changed("lib-path") {
+				globalConfig.LocalLibPath = localLibPath
+			}
+
+			// Mark as configured
+			globalConfig.EmbeddingsConfigured = true
+
+			// Save updated config
+			if err := globalStore.SaveConfig(globalConfig); err != nil {
 				log.Fatal(err)
 			}
-			defer s.DB.Close()
 
-			embedder, err := getEmbedder()
-			if err != nil {
+			// Ensure Vector Table matches dimensions
+			if err := globalStore.EnsureVectorTable(globalConfig.EmbedDimensions); err != nil {
 				log.Fatal(err)
 			}
-			defer embedder.Close()
 
-			pending, err := s.GetPendingEmbeddings()
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("Generating embeddings for %d documents (Dim: %d, Chunk: %d)...\n",
-				len(pending), cfg.EmbedDimensions, cfg.ChunkSize)
-
-			splitter := textsplitter.NewMarkdownTextSplitter(
-				textsplitter.WithChunkSize(cfg.ChunkSize),
-				textsplitter.WithChunkOverlap(cfg.ChunkOverlap),
-			)
-
-			for hash, content := range pending {
-				chunks, err := splitter.SplitText(content)
-				if err != nil {
-					log.Printf("Error splitting document %s: %v", hash, err)
-					continue
-				}
-
-				for i, chunk := range chunks {
-					vec, err := embedder.Embed(chunk, false)
-					if err != nil {
-						log.Printf("Error embedding %s (chunk %d): %v", hash, i, err)
-						continue
-					}
-
-					if len(vec) != cfg.EmbedDimensions {
-						log.Printf("Warning: Model returned %d dimensions, config/flag expects %d", len(vec), cfg.EmbedDimensions)
-					}
-
-					if err := s.SaveEmbedding(hash, i, vec); err != nil {
-						log.Fatal(err)
-					}
-				}
-				fmt.Print(".")
-			}
-			fmt.Println("\nDone.")
+			generateEmbeddings()
 		},
 	}
 
-	// --- Search ---
+	// Attach embedding-specific flags only to embed command
+	cmdEmbed.Flags().StringVar(&ollamaURL, "url", "", "Ollama API URL")
+	cmdEmbed.Flags().StringVar(&modelName, "model", "", "Embedding model name")
+	cmdEmbed.Flags().IntVar(&embedDim, "dim", 0, "Embedding vector dimensions")
+	cmdEmbed.Flags().BoolVar(&localMode, "local", false, "Use local llama.cpp inference")
+	cmdEmbed.Flags().StringVar(&localModelPath, "model-path", "", "Path to GGUF model file")
+	cmdEmbed.Flags().StringVar(&localLibPath, "lib-path", "", "Path to llama.cpp shared library")
+
 	var cmdSearch = &cobra.Command{
 		Use:   "search [query]",
 		Short: "Full text search",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			s, err := store.NewStore(cfg.EmbedDimensions)
+			results, err := globalStore.SearchFTS(args[0], 10, contextLines, findAll)
 			if err != nil {
 				log.Fatal(err)
 			}
-			defer s.DB.Close()
-
-			results, err := s.SearchFTS(args[0], 10, contextLines, findAll)
-			if err != nil {
-				log.Fatal(err)
-			}
-
 			for _, r := range results {
 				fmt.Printf("\033[1;36m[%s] %s\033[0m\n", r.Filepath, r.Title)
 				if len(r.Matches) > 0 {
@@ -230,34 +323,29 @@ func main() {
 			}
 		},
 	}
-	cmdSearch.Flags().IntVarP(&contextLines, "context", "C", 0, "Number of context lines to show before and after the match")
-	cmdSearch.Flags().BoolVarP(&findAll, "all", "a", false, "Show all matches in the file instead of just the first one")
+	cmdSearch.Flags().IntVarP(&contextLines, "context", "C", 0, "Context lines")
+	cmdSearch.Flags().BoolVarP(&findAll, "all", "a", false, "Show all matches")
 
-	// --- Vector Search ---
 	var cmdVSearch = &cobra.Command{
 		Use:   "vsearch [query]",
 		Short: "Vector semantic search",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			s, err := store.NewStore(cfg.EmbedDimensions)
-			if err != nil {
-				log.Fatal(err)
+			if !globalConfig.EmbeddingsConfigured {
+				log.Fatal("Embeddings not configured. Run 'qmd embed' first.")
 			}
-			defer s.DB.Close()
-
 			embedder, err := getEmbedder()
 			if err != nil {
 				log.Fatal(err)
 			}
 			defer embedder.Close()
 
-			fmt.Println("Embedding query...")
 			qVec, err := embedder.Embed(args[0], true)
 			if err != nil {
 				log.Fatal(err)
 			}
 
-			results, err := s.SearchVec(qVec, 10)
+			results, err := globalStore.SearchVec(qVec, 10)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -268,65 +356,56 @@ func main() {
 		},
 	}
 
-	// --- Server (MCP) ---
 	var cmdServer = &cobra.Command{
 		Use:   "server",
 		Short: "Start MCP server",
 		Run: func(cmd *cobra.Command, args []string) {
-			s, err := store.NewStore(cfg.EmbedDimensions)
-			if err != nil {
-				log.Fatalf("Failed to initialize store: %v", err)
-			}
-			defer s.DB.Close()
+			var embedder llm.Embedder
+			var err error
 
-			embedder, err := getEmbedder()
-			if err != nil {
-				log.Fatal(err)
+			if globalConfig.EmbeddingsConfigured {
+				embedder, err = getEmbedder()
+				if err != nil {
+					log.Printf("Warning: Failed to initialize embedder: %v. Vector search will be unavailable.", err)
+				} else {
+					defer embedder.Close()
+				}
+			} else {
+				log.Println("Embeddings not configured. Vector search unavailable.")
 			}
-			defer embedder.Close()
 
-			mcpSrv := mcpserver.NewServer(s, embedder)
+			mcpSrv := mcpserver.NewServer(globalStore, embedder)
 
 			log.SetOutput(os.Stderr)
-			log.Println("Starting MCP server...")
-
 			if err := mcpSrv.Start(); err != nil {
 				log.Fatal(err)
 			}
 		},
 	}
 
-	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdEmbed, cmdSearch, cmdVSearch, cmdServer)
+	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdInfo, cmdEmbed, cmdSearch, cmdVSearch, cmdServer)
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
-func reindex(colName, rootPath string, dim int) {
-	s, err := store.NewStore(dim)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer s.DB.Close()
-
+func reindex(colName, rootPath string) {
 	fmt.Printf("Indexing %s...\n", colName)
-	err = filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() && strings.HasSuffix(info.Name(), ".md") {
 			relPath, _ := filepath.Rel(rootPath, path)
 			relPath = filepath.ToSlash(relPath)
-
 			content, _ := os.ReadFile(path)
-			if err := s.IndexDocument(colName, relPath, string(content)); err != nil {
+			if err := globalStore.IndexDocument(colName, relPath, string(content)); err != nil {
 				log.Printf("Error indexing %s: %v", relPath, err)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error walking path %s: %v", rootPath, err)
 	}
 }

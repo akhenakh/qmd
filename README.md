@@ -1,12 +1,12 @@
-# qmd (Go Port)
+# qmd 
 
-A Go implementation of **Quick Markdown Search**, originally created by [Tobias Lütke](https://github.com/tobi).
+A heavily inspired Go implementation of **Quick Markdown Search**, originally created by [Tobias Lütke](https://github.com/tobi).
 
 > **Original Project:** [github.com/tobi/qmd](https://github.com/tobi/qmd)
 
 `qmd` is a command-line tool for indexing and searching markdown notes.  
 It supports both full-text search (using SQLite FTS5) and semantic vector search.  
-You can generate embeddings using either an **Ollama** server or **Local Inference** (via `llama.cpp` / `yzma`).
+You can generate embeddings using either an **Ollama** server or **Local Inference** (via embedded `llama.cpp` / `yzma`).
 
 ## Features
 
@@ -14,21 +14,19 @@ You can generate embeddings using either an **Ollama** server or **Local Inferen
 - **Vector Search**: Semantic search using embeddings (Ollama or Local).
 - **Smart Splitting**: Uses context-aware Markdown splitting (via LangChainGo) for better embedding quality.
 - **MCP Server**: Exposes search capabilities via the [Model Context Protocol](https://modelcontextprotocol.io), allowing AI assistants (like Claude Desktop) to search your notes.
-- **Local First**: All data is stored locally in `~/.cache/qmd/`.
-- **Configurable**: Persist your settings in `~/.config/qmd.yml`.
+- **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default).
+- **Multiple Collections**: Index multiple directories at once.
 
-## Prerequisites
+## Embeddings
+Using vector search is optional, it is using SQLite FTS5 BM25 if you don't.
 
-1. **Go 1.25+**
-2. **C Compiler** (gcc or clang) for SQLite extensions.
-
-### Option A: Ollama (Recommended for simplicity)
+### Embeddings Option A: Pointing to Ollama
 
 Install and run **[Ollama](https://ollama.com/)**.
 
-### Option B: Local Inference (Recommended for performance/control)
+### Option B: Local Inference
 
-If you prefer to run the model directly within `qmd` without an external server, you need the `llama.cpp` shared libraries. We use [yzma](https://github.com/hybridgroup/yzma) to manage these.
+If you prefer to run the model directly within `qmd` without an external server, you need to fetch lamacpp shared libraries. We use [yzma](https://github.com/hybridgroup/yzma) to manage these, or you can download them manually.
 
 1. **Install the `yzma` tool:**
    ```bash
@@ -61,114 +59,112 @@ cd qmd
 go build -tags sqlite_fts5
 ```
 
-## Configuration
+## Quick Start Workflow
 
-`qmd` stores its configuration in `~/.config/qmd.yml`. This file is created automatically on the first run, but you can create/edit it manually to persist your settings.
+`qmd` stores everything in a local database (default: `./qmd.sqlite`). You don't need to manually edit configuration files; settings are stored in the database when you run commands.
 
-**Example `~/.config/qmd.yml`:**
+### 1. Index Notes
 
-```yaml
-ollama_url: http://localhost:11434
-model_name: nomic-embed-text
-embed_dimensions: 768
-chunk_size: 1000
-chunk_overlap: 200
-
-# Local Inference Settings
-use_local: false
-local_model_path: /path/to/nomic-embed-text-v1.5.Q8_0.gguf
-local_lib_path: /home/user/qmd/lib
-```
-
-## Usage
-
-### 1. Indexing Notes
-
-Add a directory of markdown files to the index:
+Add one or more directories containing markdown files.
 
 ```bash
-qmd add ~/Documents/Notes
-```
-
-To update the index later (re-scans all collections):
-
-```bash
-qmd update
+qmd add ./example ~/Documents/Obsidian
 ```
 
 ### 2. Full-Text Search
 
-Search by keyword (BM25):
+You can immediately search using keywords (BM25).
 
 ```bash
-qmd search "meeting notes"
+qmd search "postgres slow"
 ```
 
-Options:
-- `--context N`: Show N lines of context around the match.
-- `--all`: Show all matches in a file (default shows only the first/best one).
+### 3. Generate Embeddings
 
-### 3. Semantic Search
+To enable Semantic Search (`vsearch`), you must configure the embedding model and generate vectors. This command saves the configuration to the database for future updates.
 
-First, ensure your notes are embedded.
-
-#### Using Ollama (Default)
-
-1. Ensure Ollama is running (`ollama pull nomic-embed-text`).
-2. Generate embeddings:
-   ```bash
-   qmd embed
-   ```
-3. Search:
-   ```bash
-   qmd vsearch "decisions about architecture"
-   ```
-
-#### Using Local Inference
-
-You can run entirely offline using `llama.cpp` libraries.
-
-**Method A: Configuration File (Recommended)**
-Edit `~/.config/qmd.yml`:
-```yaml
-use_local: true
-local_model_path: /path/to/nomic.gguf
-local_lib_path: /path/to/llamalib
-```
-Then run commands normally:
+**Using Local Inference (llama.cpp):**
 ```bash
-qmd embed
-qmd vsearch "my query"
+qmd embed --local --model-path /opt/ml/nomic-embed-text-v1.5.Q8_0.gguf --lib-path ~/lib/yzma
 ```
 
-**Method B: CLI Flags**
-Override configuration on the fly:
+**Or using Ollama:**
 ```bash
-qmd embed --local \
-  --model-path /path/to/nomic.gguf \
-  --lib-path ~/lib
+qmd embed --url http://localhost:11434 --model nomic-embed-text
 ```
 
-*(Tip: You can set the `YZMA_LIB` environment variable to avoid passing `--lib-path` every time.)*
+### 4. Semantic Search
 
-### 4. MCP Server
-
-Start the Model Context Protocol server to connect `qmd` to AI agents:
+Once embeddings are generated:
 
 ```bash
-qmd server
+qmd vsearch "performance issues with database"
 ```
 
-#### Configuring Claude Desktop
+## Detailed Usage
 
-Add the following to your `claude_desktop_config.json`:
+### Global Flags
+
+- `--db <path>`: Path to the SQLite database (default `./qmd.sqlite`). Use this if you want to maintain different indexes.
+
+### Commands
+
+#### `add [path...]`
+Adds folders to the index configuration. It recursively scans for `.md` files.
+```bash
+qmd add ~/Notes ~/Work/Docs
+```
+
+#### `update`
+Rescans all configured collections for new or modified files.
+- Updates FTS index immediately.
+- If embeddings have been configured (via `qmd embed` previously), it automatically generates embeddings for new content.
+```bash
+qmd update
+```
+
+#### `search [query]`
+Standard keyword search.
+- `--context N`: Show N lines of context (default 0).
+- `--all`: Show all matches in a file (default false).
+```bash
+qmd search "meeting" --context 2
+```
+
+#### `embed`
+Configures embedding settings and generates vectors for pending documents.
+- **Flags**:
+    - `--local`: Enable local llama.cpp mode.
+    - `--model-path`: Path to GGUF model (Local).
+    - `--lib-path`: Path to llama.cpp library (Local). Can also use `YZMA_LIB` env var.
+    - `--url`: Ollama URL (Default `http://localhost:11434`).
+    - `--model`: Model name (Default `nomic-embed-text`).
+    - `--dim`: Vector dimensions (Default `768`).
+
+#### `vsearch [query]`
+Performs cosine similarity search against generated embeddings. Requires `embed` to have been run at least once.
+
+#### `info`
+Displays current configuration, indexed collections, and database statistics.
+```bash
+qmd info
+```
+
+#### `server`
+Starts the Model Context Protocol (MCP) server for integration with AI agents.
+
+## MCP Server Integration
+
+Connect `qmd` to AI agents like Claude Desktop.
+
+**`claude_desktop_config.json`:**
 
 ```json
 {
   "mcpServers": {
     "qmd": {
       "command": "/absolute/path/to/qmd",
-      "args": ["server"]
+      "args": ["server", "--db", "/absolute/path/to/qmd.sqlite"]
     }
   }
 }

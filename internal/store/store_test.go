@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/akhenakh/qmd/internal/store"
@@ -15,21 +16,19 @@ func setupTestEnv(t *testing.T) (*store.Store, func()) {
 	tempDir, err := os.MkdirTemp("", "qmd_test_*")
 	require.NoError(t, err)
 
-	originalCacheEnv := os.Getenv("XDG_CACHE_HOME")
-	originalWinEnv := os.Getenv("LocalAppData")
+	dbPath := filepath.Join(tempDir, "test.sqlite")
 
-	os.Setenv("XDG_CACHE_HOME", tempDir)
-	os.Setenv("LocalAppData", tempDir)
+	// Pass path to NewStore
+	s, err := store.NewStore(dbPath)
+	require.NoError(t, err)
 
-	// Pass dimensions to NewStore (768 for test)
-	s, err := store.NewStore(768)
+	// Ensure vector table for testing (768 dim)
+	err = s.EnsureVectorTable(768)
 	require.NoError(t, err)
 
 	cleanup := func() {
 		s.DB.Close()
 		os.RemoveAll(tempDir)
-		os.Setenv("XDG_CACHE_HOME", originalCacheEnv)
-		os.Setenv("LocalAppData", originalWinEnv)
 	}
 
 	return s, cleanup

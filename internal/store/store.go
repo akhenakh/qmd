@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/akhenakh/qmd/internal/config"
 	"github.com/akhenakh/qmd/internal/util"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
@@ -16,22 +18,19 @@ import (
 )
 
 type Store struct {
-	DB *sql.DB
+	DB     *sql.DB
+	DBPath string
 }
 
-func NewStore(embedDim int) (*Store, error) {
+func NewStore(dbPath string) (*Store, error) {
 	sqlite_vec.Auto() // Load sqlite-vec extension
 
-	cacheDir, _ := os.UserCacheDir()
-	// Allow overriding cache dir via env for testing
-	if envCache := os.Getenv("XDG_CACHE_HOME"); envCache != "" {
-		cacheDir = envCache
-	}
-
-	dbPath := filepath.Join(cacheDir, "qmd", "index.sqlite")
-
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		return nil, err
+	// Ensure directory exists if path has one
+	dir := filepath.Dir(dbPath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
 	}
 
 	db, err := sql.Open("sqlite3", dbPath)
@@ -41,24 +40,32 @@ func NewStore(embedDim int) (*Store, error) {
 
 	// WAL mode for concurrency
 	if _, err := db.Exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;"); err != nil {
+		db.Close()
 		return nil, err
 	}
 
-	s := &Store{DB: db}
-	if err := s.initSchema(embedDim); err != nil {
+	s := &Store{DB: db, DBPath: dbPath}
+	if err := s.initBasicSchema(); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) initSchema(embedDim int) error {
-	// Dynamically create the vector table with the correct dimensions
-	vectorTableSQL := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
-		hash_seq TEXT PRIMARY KEY,
-		embedding float[%d] distance_metric=cosine
-	)`, embedDim)
-
+func (s *Store) initBasicSchema() error {
 	queries := []string{
+		// Metadata tables
+		`CREATE TABLE IF NOT EXISTS config (
+			key TEXT PRIMARY KEY,
+			value TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS collections (
+			path TEXT PRIMARY KEY,
+			name TEXT,
+			pattern TEXT,
+			context TEXT
+		)`,
+		// Content tables
 		`CREATE TABLE IF NOT EXISTS content (
 			hash TEXT PRIMARY KEY,
 			doc TEXT NOT NULL,
@@ -98,8 +105,7 @@ func (s *Store) initSchema(embedDim int) error {
 			SELECT new.id, new.collection || '/' || new.path, new.title, 
 			(SELECT doc FROM content WHERE hash = new.hash);
 		 END`,
-		// Vector Tables
-		vectorTableSQL,
+		// Vector mapping table (vector table created separately based on dim)
 		`CREATE TABLE IF NOT EXISTS content_vectors (
 			hash TEXT NOT NULL,
 			seq INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +119,156 @@ func (s *Store) initSchema(embedDim int) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) EnsureVectorTable(dim int) error {
+	query := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
+		hash_seq TEXT PRIMARY KEY,
+		embedding float[%d] distance_metric=cosine
+	)`, dim)
+
+	_, err := s.DB.Exec(query)
+	return err
+}
+
+func (s *Store) LoadConfig() (*config.Config, error) {
+	cfg := config.Default()
+
+	// Load Key-Values
+	rows, err := s.DB.Query("SELECT key, value FROM config")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	kv := make(map[string]string)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err == nil {
+			kv[k] = v
+		}
+	}
+
+	if v, ok := kv["ollama_url"]; ok {
+		cfg.OllamaURL = v
+	}
+	if v, ok := kv["model_name"]; ok {
+		cfg.ModelName = v
+	}
+	if v, ok := kv["embed_dimensions"]; ok {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.EmbedDimensions = i
+		}
+	}
+	if v, ok := kv["use_local"]; ok {
+		cfg.UseLocal = (v == "true")
+	}
+	if v, ok := kv["local_model_path"]; ok {
+		cfg.LocalModelPath = v
+	}
+	if v, ok := kv["local_lib_path"]; ok {
+		cfg.LocalLibPath = v
+	}
+	if v, ok := kv["chunk_size"]; ok {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.ChunkSize = i
+		}
+	}
+	if v, ok := kv["chunk_overlap"]; ok {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.ChunkOverlap = i
+		}
+	}
+	if v, ok := kv["embeddings_configured"]; ok {
+		cfg.EmbeddingsConfigured = (v == "true")
+	}
+
+	// Load Collections
+	cRows, err := s.DB.Query("SELECT path, name, pattern, context FROM collections")
+	if err != nil {
+		return cfg, nil
+	}
+	defer cRows.Close()
+
+	for cRows.Next() {
+		var path, name, pattern, contextJSON string
+		if err := cRows.Scan(&path, &name, &pattern, &contextJSON); err == nil {
+			c := config.Collection{
+				Path:    path,
+				Name:    name,
+				Pattern: pattern,
+				Context: make(map[string]string),
+			}
+			if contextJSON != "" {
+				json.Unmarshal([]byte(contextJSON), &c.Context)
+			}
+			cfg.Collections = append(cfg.Collections, c)
+		}
+	}
+
+	return cfg, nil
+}
+
+func (s *Store) SaveConfig(cfg *config.Config) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	upsert := func(k, v string) error {
+		_, err := tx.Exec("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", k, v)
+		return err
+	}
+
+	// Only save embedding parameters if they have been configured (i.e. 'qmd embed' run)
+	if cfg.EmbeddingsConfigured {
+		if err := upsert("ollama_url", cfg.OllamaURL); err != nil {
+			return err
+		}
+		if err := upsert("model_name", cfg.ModelName); err != nil {
+			return err
+		}
+		if err := upsert("embed_dimensions", strconv.Itoa(cfg.EmbedDimensions)); err != nil {
+			return err
+		}
+		if err := upsert("use_local", fmt.Sprintf("%v", cfg.UseLocal)); err != nil {
+			return err
+		}
+		if err := upsert("local_model_path", cfg.LocalModelPath); err != nil {
+			return err
+		}
+		if err := upsert("local_lib_path", cfg.LocalLibPath); err != nil {
+			return err
+		}
+		if err := upsert("chunk_size", strconv.Itoa(cfg.ChunkSize)); err != nil {
+			return err
+		}
+		if err := upsert("chunk_overlap", strconv.Itoa(cfg.ChunkOverlap)); err != nil {
+			return err
+		}
+	}
+
+	// Always save the configuration state flag
+	if err := upsert("embeddings_configured", fmt.Sprintf("%v", cfg.EmbeddingsConfigured)); err != nil {
+		return err
+	}
+
+	// Overwrite collections
+	if _, err := tx.Exec("DELETE FROM collections"); err != nil {
+		return err
+	}
+
+	for _, c := range cfg.Collections {
+		ctxBytes, _ := json.Marshal(c.Context)
+		_, err := tx.Exec("INSERT INTO collections (path, name, pattern, context) VALUES (?, ?, ?, ?)",
+			c.Path, c.Name, c.Pattern, string(ctxBytes))
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (s *Store) IndexDocument(colName, path, content string) error {
@@ -157,21 +313,10 @@ type SearchResult struct {
 }
 
 func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll bool) ([]SearchResult, error) {
-	// Robust FTS5 query construction
 	query = strings.TrimSpace(query)
-	// Remove existing quotes to prevent SQL syntax errors in FTS construction
 	cleanQuery := strings.ReplaceAll(query, "\"", "")
-
-	// We use standard quoted search (`"query"`) to ensure tokens are processed
-	// by the tokenizer (Porter) as a phrase or exact stemmed words.
-	// We avoid appending `*` (prefix wildcard) blindly because it often disables
-	// stemming on the query side while the index remains stemmed, causing matches
-	// like "architecture" vs "architectur" to fail.
 	ftsQuery := fmt.Sprintf(`"%s"`, cleanQuery)
 
-	// Note: We retrieve 'body' to manually build context snippets
-	// We cannot use offsets() function in the main query due to SQLite limitations
-	// with parameterized queries, so we'll get offsets separately if needed
 	rows, err := s.DB.Query(`
 		SELECT 
 			rowid, 
@@ -197,35 +342,10 @@ func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll boo
 			return nil, err
 		}
 
-		// Get offsets for this document
-		// Note: The offsets() function in SQLite FTS5 has very specific requirements
-		// and cannot be used in the way we need. We'll implement context manually.
-		var offsets string
-
-		// First, check if this row actually matches the query
-		var matchCount int
-		err := s.DB.QueryRow(`SELECT COUNT(*) FROM documents_fts WHERE rowid = ? AND documents_fts MATCH ?`, r.DocID, ftsQuery).Scan(&matchCount)
-		if err != nil || matchCount == 0 {
-			offsets = ""
-		} else {
-			// Try to get offsets using a different approach
-			// According to FTS5 docs, offsets() can only be used in specific contexts
-			// Let's try to get the highlighted version and extract positions from that
-			var highlighted string
-			err := s.DB.QueryRow(`SELECT highlight(documents_fts, 2, '[[', ']]') FROM documents_fts WHERE rowid = ? AND documents_fts MATCH ?`, r.DocID, ftsQuery).Scan(&highlighted)
-			if err != nil && err != sql.ErrNoRows {
-				offsets = ""
-			} else {
-				// We'll extract the match positions manually from the body
-				offsets = extractOffsetsFromBody(body, query)
-			}
-		}
-
+		offsets := extractOffsetsFromBody(body, query)
 		r.Matches = extractMatches(body, offsets, contextLines, findAll)
 
 		if len(r.Matches) == 0 {
-			// Fallback snippet if matches were in title or metadata, not body
-			// Or if extraction logic returned nothing
 			if len(body) > 200 {
 				r.Snippet = body[:200] + "..."
 			} else {
@@ -248,19 +368,11 @@ func max(a, b int) int {
 }
 
 func extractOffsetsFromBody(body string, query string) string {
-	// Simple implementation: find all occurrences of the query in the body
-	// and return them in the FTS5 offsets format: colNum termNum byteOffset size
-	// For now, we'll just find the query in the body and return basic offsets
-	// This is a simplified approach - a proper implementation would need to
-	// tokenize the text the same way FTS5 does
-
 	cleanQuery := strings.TrimSpace(strings.ToLower(query))
 	if cleanQuery == "" {
 		return ""
 	}
 
-	// For now, let's do a simple case-insensitive search
-	// Note: This is a simplified approach and may not match FTS5's tokenization exactly
 	bodyLower := strings.ToLower(body)
 	queryLower := strings.ToLower(cleanQuery)
 
@@ -278,7 +390,7 @@ func extractOffsetsFromBody(body string, query string) string {
 		offsetsParts = append(offsetsParts,
 			fmt.Sprintf("2 0 %d %d", actualPos, len(query)))
 
-		idx = actualPos + 1 // Move past this match to find others
+		idx = actualPos + 1
 	}
 
 	return strings.Join(offsetsParts, " ")
@@ -286,8 +398,6 @@ func extractOffsetsFromBody(body string, query string) string {
 
 func extractMatches(body string, offsetsStr string, n int, findAll bool) []string {
 	parts := strings.Fields(offsetsStr)
-	// FTS5 offsets: colNum, termNum, byteOffset, size
-
 	type match struct {
 		start int
 		end   int
@@ -296,13 +406,9 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 
 	for i := 0; i < len(parts); i += 4 {
 		col, _ := strconv.Atoi(parts[i])
-
-		// 0=filepath, 1=title, 2=body
-		// We only want to extract context from the body content
 		if col != 2 {
 			continue
 		}
-
 		offset, _ := strconv.Atoi(parts[i+2])
 		size, _ := strconv.Atoi(parts[i+3])
 		matches = append(matches, match{start: offset, end: offset + size})
@@ -317,25 +423,19 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 	}
 
 	lines := strings.Split(body, "\n")
-
-	// Pre-calculate line start byte offsets to map byte offsets to line numbers
-	// Note: Using byte length logic consistent with how SQLite counts offsets (bytes)
-	// vs Go string range (bytes).
 	lineOffsets := make([]int, len(lines)+1)
 	currentOffset := 0
 	for i, line := range lines {
 		lineOffsets[i] = currentOffset
-		currentOffset += len(line) + 1 // +1 accounts for the newline char that Split consumes
+		currentOffset += len(line) + 1
 	}
 	lineOffsets[len(lines)] = currentOffset
 
 	var results []string
 
 	for _, m := range matches {
-		// Identify which line number contains the match start
 		lineIdx := 0
 		for i := 0; i < len(lines); i++ {
-			// Check if match start is within this line's range [start, next_start)
 			if m.start >= lineOffsets[i] && m.start < lineOffsets[i+1] {
 				lineIdx = i
 				break
@@ -480,9 +580,21 @@ func (s *Store) GetStats() (*Stats, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = s.DB.QueryRow("SELECT COUNT(*) FROM vectors_vec").Scan(&stats.Embeddings)
+
+	// Safely check if vectors_vec exists before counting
+	var exists int
+	err = s.DB.QueryRow("SELECT count(*) FROM sqlite_master WHERE name='vectors_vec'").Scan(&exists)
 	if err != nil {
 		return nil, err
+	}
+
+	if exists == 1 {
+		err = s.DB.QueryRow("SELECT COUNT(*) FROM vectors_vec").Scan(&stats.Embeddings)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		stats.Embeddings = 0
 	}
 	return stats, nil
 }
