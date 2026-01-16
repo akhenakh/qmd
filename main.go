@@ -47,9 +47,9 @@ func getEmbedder() (llm.Embedder, error) {
 			return nil, fmt.Errorf("local mode enabled but local_lib_path is missing")
 		}
 		fmt.Printf("Loading local model: %s\n", globalConfig.LocalModelPath)
-		return llm.NewLocalClient(globalConfig.LocalModelPath, globalConfig.LocalLibPath)
+		return llm.NewLocalClient(globalConfig.LocalModelPath, globalConfig.LocalLibPath, globalConfig.EmbedDimensions)
 	}
-	return llm.NewHTTPClient(globalConfig.OllamaURL, globalConfig.ModelName), nil
+	return llm.NewHTTPClient(globalConfig.OllamaURL, globalConfig.ModelName, globalConfig.EmbedDimensions), nil
 }
 
 func generateEmbeddings() {

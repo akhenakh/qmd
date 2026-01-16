@@ -1,7 +1,5 @@
 # qmd 
 
-A heavily inspired Go implementation of **Quick Markdown Search**,  [Quick Markdown Search](https://github.com/tobi/qmd), originally created by [Tobias Lütke](https://github.com/tobi).
-
 `qmd` is a command-line tool for indexing and searching markdown notes.  
 It supports full-text search (BM25), semantic vector search, and hybrid search (RRF).  
 You can generate embeddings using either an **Ollama** server or **Local Inference** (via embedded `llama.cpp` / `yzma`).
@@ -14,6 +12,11 @@ You can generate embeddings using either an **Ollama** server or **Local Inferen
 - **Smart Splitting**: Uses context-aware Markdown splitting (via LangChainGo) for better embedding quality.
 - **MCP Server**: Exposes search capabilities via the [Model Context Protocol](https://modelcontextprotocol.io), allowing AI assistants (like Claude Desktop) to search your notes.
 - **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default), so that you can point to different db for different purposes.
+
+## Origin
+
+A heavily inspired Go implementation of **Quick Markdown Search**,  [Quick Markdown Search](https://github.com/tobi/qmd), originally created by [Tobias Lütke](https://github.com/tobi).
+Some opinionated differences with the original, make it a bit different, mainly all configurations and settings are self contained into the db file, making it possible to reuse the index in different places and for multiple scenarios.
 
 ## Prerequisites
 

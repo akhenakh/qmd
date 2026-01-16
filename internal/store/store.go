@@ -435,7 +435,7 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 
 	for _, m := range matches {
 		lineIdx := 0
-		for i := 0; i < len(lines); i++ {
+		for i := range lines {
 			if m.start >= lineOffsets[i] && m.start < lineOffsets[i+1] {
 				lineIdx = i
 				break

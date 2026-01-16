@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 )
@@ -11,13 +12,15 @@ import (
 type HTTPClient struct {
 	BaseURL    string
 	Model      string
+	TargetDim  int
 	HTTPClient *http.Client
 }
 
-func NewHTTPClient(baseURL, model string) *HTTPClient {
+func NewHTTPClient(baseURL, model string, targetDim int) *HTTPClient {
 	return &HTTPClient{
-		BaseURL: baseURL,
-		Model:   model,
+		BaseURL:   baseURL,
+		Model:     model,
+		TargetDim: targetDim,
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -67,7 +70,27 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 		return nil, err
 	}
 
-	return result.Embedding, nil
+	vec := result.Embedding
+
+	// Handle Matryoshka Truncation
+	if c.TargetDim > 0 && len(vec) > c.TargetDim {
+		vec = vec[:c.TargetDim]
+
+		// Re-normalize after truncation
+		var sum float64
+		for _, v := range vec {
+			sum += float64(v * v)
+		}
+		sum = math.Sqrt(sum)
+		if sum > 0 {
+			norm := float32(1.0 / sum)
+			for i := range vec {
+				vec[i] *= norm
+			}
+		}
+	}
+
+	return vec, nil
 }
 
 func (c *HTTPClient) Close() error {

@@ -44,7 +44,6 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) registerTools() {
-	// --- Search Tool ---
 	searchTool := mcp.NewTool("search",
 		mcp.WithDescription("Full text search using BM25. Use this for specific keywords."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
@@ -82,7 +81,7 @@ func (s *Server) registerTools() {
 		return mcp.NewToolResultText(sb.String()), nil
 	})
 
-	// --- Vector Search Tool ---
+	// Vector Search Tool
 	vsearchTool := mcp.NewTool("vsearch",
 		mcp.WithDescription("Semantic search using vector embeddings. Use this for concept search or when keywords miss."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
@@ -114,7 +113,7 @@ func (s *Server) registerTools() {
 		return mcp.NewToolResultText(sb.String()), nil
 	})
 
-	// --- Get Document Tool ---
+	// Get Document Tool
 	getTool := mcp.NewTool("get_document",
 		mcp.WithDescription("Retrieve the full content of a specific document"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("The document path (e.g., 'notes/meeting.md')")),
@@ -138,7 +137,7 @@ func (s *Server) registerTools() {
 		return mcp.NewToolResultText(content), nil
 	})
 
-	// --- Status Tool ---
+	// Status Tool
 	statusTool := mcp.NewTool("status",
 		mcp.WithDescription("Get the status of the qmd index"),
 	)

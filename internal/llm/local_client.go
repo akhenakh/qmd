@@ -17,9 +17,10 @@ type LocalClient struct {
 	Model     llama.Model
 	UseEncode bool
 	MaxTokens int
+	TargetDim int
 }
 
-func NewLocalClient(modelFile, libPath string) (*LocalClient, error) {
+func NewLocalClient(modelFile, libPath string, targetDim int) (*LocalClient, error) {
 	if _, err := os.Stat(modelFile); os.IsNotExist(err) {
 		return nil, fmt.Errorf("model file not found: %s", modelFile)
 	}
@@ -100,16 +101,21 @@ func NewLocalClient(modelFile, libPath string) (*LocalClient, error) {
 		Context:   lctx,
 		UseEncode: useEncode,
 		MaxTokens: maxTokens,
+		TargetDim: targetDim,
 	}, nil
 }
 
 func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
-	// Nomic formatting
-	prefix := "search_document: "
-	if isQuery {
-		prefix = "search_query: "
+	// Only apply Nomic formatting if the model appears to be Nomic.
+	// Qwen and others typically expect raw text or different templates.
+	prompt := text
+	if strings.Contains(strings.ToLower(c.ModelFile), "nomic") {
+		prefix := "search_document: "
+		if isQuery {
+			prefix = "search_query: "
+		}
+		prompt = prefix + text
 	}
-	prompt := prefix + text
 
 	vocab := llama.ModelGetVocab(c.Model)
 
@@ -125,6 +131,11 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 
 	// Create batch
 	batch := llama.BatchGetOne(tokens)
+
+	// Clear the KV cache. This is crucial for embeddings generation using Decode (decoder-only models like Qwen/Llama).
+	// Without clearing, the context fills up with tokens from previous documents, causing "failed to find a memory slot" errors.
+	mem, _ := llama.GetMemory(c.Context)
+	llama.MemoryClear(mem, true)
 
 	var ret int32
 	var err error
@@ -152,12 +163,20 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 		return nil, fmt.Errorf("failed to get embeddings: %w", err)
 	}
 
+	// Handle Matryoshka Truncation (if target dim is smaller than model output)
+	if c.TargetDim > 0 && len(vec) > c.TargetDim {
+		vec = vec[:c.TargetDim]
+	}
+
 	// Normalize (Cosine Similarity requires normalized vectors)
 	var sum float64
 	for _, v := range vec {
 		sum += float64(v * v)
 	}
 	sum = math.Sqrt(sum)
+	if sum == 0 {
+		return vec, nil
+	}
 	norm := float32(1.0 / sum)
 
 	normalized := make([]float32, len(vec))
