@@ -63,6 +63,7 @@ func (s *Store) initBasicSchema() error {
 			path TEXT PRIMARY KEY,
 			name TEXT,
 			pattern TEXT,
+			exclude TEXT, 
 			context TEXT
 		)`,
 		// Content tables
@@ -115,7 +116,12 @@ func (s *Store) initBasicSchema() error {
 
 	for _, q := range queries {
 		if _, err := s.DB.Exec(q); err != nil {
-			return err
+			// Handle schema migration for existing DBs simply by ignoring error or checking column
+			// Ideally proper migration, but for this snippet we assume "if not exists" handles creation
+			// To support adding column to existing table:
+			if strings.Contains(q, "collections") {
+				s.DB.Exec("ALTER TABLE collections ADD COLUMN exclude TEXT")
+			}
 		}
 	}
 	return nil
@@ -184,23 +190,33 @@ func (s *Store) LoadConfig() (*config.Config, error) {
 	}
 
 	// Load Collections
-	cRows, err := s.DB.Query("SELECT path, name, pattern, context FROM collections")
+	// We handle the case where exclude column might not exist in older DBs
+	// via basic query logic or explicit selection
+	cRows, err := s.DB.Query("SELECT path, name, pattern, exclude, context FROM collections")
 	if err != nil {
-		return cfg, nil
+		// Fallback for older schema if migration didn't run via init
+		cRows, err = s.DB.Query("SELECT path, name, pattern, '', context FROM collections")
+		if err != nil {
+			return cfg, nil
+		}
 	}
 	defer cRows.Close()
 
 	for cRows.Next() {
-		var path, name, pattern, contextJSON string
-		if err := cRows.Scan(&path, &name, &pattern, &contextJSON); err == nil {
+		var path, name, pattern, excludeJSON, contextJSON string
+		if err := cRows.Scan(&path, &name, &pattern, &excludeJSON, &contextJSON); err == nil {
 			c := config.Collection{
 				Path:    path,
 				Name:    name,
 				Pattern: pattern,
 				Context: make(map[string]string),
+				Exclude: make([]string, 0),
 			}
 			if contextJSON != "" {
 				json.Unmarshal([]byte(contextJSON), &c.Context)
+			}
+			if excludeJSON != "" {
+				json.Unmarshal([]byte(excludeJSON), &c.Exclude)
 			}
 			cfg.Collections = append(cfg.Collections, c)
 		}
@@ -261,8 +277,9 @@ func (s *Store) SaveConfig(cfg *config.Config) error {
 
 	for _, c := range cfg.Collections {
 		ctxBytes, _ := json.Marshal(c.Context)
-		_, err := tx.Exec("INSERT INTO collections (path, name, pattern, context) VALUES (?, ?, ?, ?)",
-			c.Path, c.Name, c.Pattern, string(ctxBytes))
+		excBytes, _ := json.Marshal(c.Exclude)
+		_, err := tx.Exec("INSERT INTO collections (path, name, pattern, exclude, context) VALUES (?, ?, ?, ?, ?)",
+			c.Path, c.Name, c.Pattern, string(excBytes), string(ctxBytes))
 		if err != nil {
 			return err
 		}
@@ -435,7 +452,7 @@ func extractMatches(body string, offsetsStr string, n int, findAll bool) []strin
 
 	for _, m := range matches {
 		lineIdx := 0
-		for i := range lines {
+		for i := 0; i < len(lines); i++ {
 			if m.start >= lineOffsets[i] && m.start < lineOffsets[i+1] {
 				lineIdx = i
 				break
@@ -602,7 +619,7 @@ func (s *Store) GetStats() (*Stats, error) {
 // SearchHybrid performs both FTS and Vector search and combines them using RRF.
 // It fetches more candidates (limit * 2) from each source to ensure good intersection.
 func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int) ([]SearchResult, error) {
-	// 1. Run searches in parallel (mocked here by sequential for simplicity, or use goroutines)
+	// Run searches in parallel (mocked here by sequential for simplicity, or use goroutines)
 	// We ask for more results (2x limit) from individual engines to improve fusion quality
 	candidateLimit := limit * 2
 
@@ -619,10 +636,10 @@ func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int) ([
 		return nil, fmt.Errorf("vector search failed: %w", err)
 	}
 
-	// 2. Fuse Results
+	// Fuse Results
 	fused := ReciprocalRankFusion(ftsResults, vecResults)
 
-	// 3. Apply final limit
+	// Apply final limit
 	if len(fused) > limit {
 		fused = fused[:limit]
 	}

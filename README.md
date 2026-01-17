@@ -186,6 +186,16 @@ Connect `qmd` to AI agents like Claude Desktop.
 }
 ```
 
+### Exposed Tools
+
+When running as an MCP server, `qmd` exposes the following tools to the AI agent:
+
+- **`search`**: Full-text search (BM25). Good for specific keywords.
+- **`vsearch`**: Semantic vector search. Good for concepts.
+- **`query`**: Hybrid search (BM25 + Vector + RRF). The most robust search method.
+- **`get_document`**: Retrieves the full content of a specific file.
+- **`status`**: Returns index statistics.
+
 ## License
 
 MIT

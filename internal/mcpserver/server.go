@@ -113,6 +113,49 @@ func (s *Server) registerTools() {
 		return mcp.NewToolResultText(sb.String()), nil
 	})
 
+	// Hybrid Query Tool
+	queryTool := mcp.NewTool("query",
+		mcp.WithDescription("Hybrid search using both keywords and semantic meaning (RRF). Combines BM25 and Vector search for best results."),
+		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
+		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
+	)
+
+	s.mcp.AddTool(queryTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if s.llm == nil {
+			return mcp.NewToolResultError("Embeddings are not configured. Hybrid search unavailable."), nil
+		}
+
+		query, _ := request.RequireString("query")
+		limit := request.GetInt("limit", 10)
+
+		// Generate embedding
+		vec, err := s.llm.Embed(query, true)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Embedding generation failed: %v", err)), nil
+		}
+
+		results, err := s.store.SearchHybrid(query, vec, limit)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Hybrid search failed: %v", err)), nil
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
+		for _, r := range results {
+			sb.WriteString(fmt.Sprintf("## %s (Score: %.2f)\n", r.Filepath, r.Score))
+			if len(r.Matches) > 0 {
+				for _, match := range r.Matches {
+					sb.WriteString(fmt.Sprintf("%s\n...\n", match))
+				}
+			} else {
+				sb.WriteString(fmt.Sprintf("%s\n", r.Snippet))
+			}
+			sb.WriteString("\n")
+		}
+
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
 	// Get Document Tool
 	getTool := mcp.NewTool("get_document",
 		mcp.WithDescription("Retrieve the full content of a specific document"),

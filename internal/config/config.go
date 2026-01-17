@@ -4,6 +4,7 @@ type Collection struct {
 	Name    string            `json:"name"`
 	Path    string            `json:"path"`
 	Pattern string            `json:"pattern"`
+	Exclude []string          `json:"exclude"`
 	Context map[string]string `json:"context"`
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/akhenakh/qmd/internal/llm"
 	"github.com/akhenakh/qmd/internal/mcpserver"
 	"github.com/akhenakh/qmd/internal/store"
+	"github.com/akhenakh/qmd/internal/util"
 
 	"github.com/spf13/cobra"
 	"github.com/tmc/langchaingo/textsplitter"
@@ -30,6 +31,8 @@ var (
 	contextLines int
 	findAll      bool
 
+	excludePatterns []string
+
 	// Global instances
 	globalStore  *store.Store
 	globalConfig *config.Config
@@ -47,8 +50,10 @@ func getEmbedder() (llm.Embedder, error) {
 			return nil, fmt.Errorf("local mode enabled but local_lib_path is missing")
 		}
 		fmt.Printf("Loading local model: %s\n", globalConfig.LocalModelPath)
+		// Pass the target dimension
 		return llm.NewLocalClient(globalConfig.LocalModelPath, globalConfig.LocalLibPath, globalConfig.EmbedDimensions)
 	}
+	// Pass the target dimension
 	return llm.NewHTTPClient(globalConfig.OllamaURL, globalConfig.ModelName, globalConfig.EmbedDimensions), nil
 }
 
@@ -164,6 +169,9 @@ func main() {
 			} else {
 				for _, col := range globalConfig.Collections {
 					fmt.Printf("- %s\n  Path: %s\n  Pattern: %s\n", col.Name, col.Path, col.Pattern)
+					if len(col.Exclude) > 0 {
+						fmt.Printf("  Exclude: %v\n", col.Exclude)
+					}
 				}
 			}
 			fmt.Println()
@@ -217,10 +225,14 @@ func main() {
 						Name:    name,
 						Path:    absPath,
 						Pattern: "**/*.md",
+						Exclude: excludePatterns,
 					}
 					globalConfig.Collections = append(globalConfig.Collections, newCol)
 					added = append(added, newCol)
 					fmt.Printf("Added collection '%s' at %s\n", name, absPath)
+					if len(excludePatterns) > 0 {
+						fmt.Printf("  Excluding: %v\n", excludePatterns)
+					}
 				} else {
 					fmt.Printf("Collection already exists: %s\n", absPath)
 				}
@@ -232,18 +244,19 @@ func main() {
 				}
 				// Reindex newly added collections
 				for _, col := range added {
-					reindex(col.Name, col.Path)
+					reindex(col)
 				}
 			}
 		},
 	}
+	cmdAdd.Flags().StringSliceVarP(&excludePatterns, "exclude", "x", nil, "Glob patterns to exclude (e.g. node_modules, *.tmp)")
 
 	var cmdUpdate = &cobra.Command{
 		Use:   "update",
 		Short: "Update index",
 		Run: func(cmd *cobra.Command, args []string) {
 			for _, col := range globalConfig.Collections {
-				reindex(col.Name, col.Path)
+				reindex(col)
 			}
 
 			// Only update embeddings if configured
@@ -470,23 +483,39 @@ func main() {
 	}
 }
 
-func reindex(colName, rootPath string) {
-	fmt.Printf("Indexing %s...\n", colName)
-	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+func reindex(col config.Collection) {
+	fmt.Printf("Indexing %s...\n", col.Name)
+	err := filepath.Walk(col.Path, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+
+		// Calculate relative path for exclusion check
+		relPath, err := filepath.Rel(col.Path, path)
+		if err != nil {
+			return err
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		// Check exclusion
+		if excluded, pattern := util.IsExcluded(relPath, col.Exclude); excluded {
+			if info.IsDir() {
+				// fmt.Printf("Skipping excluded dir: %s (matches %s)\n", relPath, pattern)
+				return filepath.SkipDir
+			}
+			fmt.Printf("Skipping excluded file: %s (matches %s)\n", relPath, pattern)
+			return nil
+		}
+
 		if !info.IsDir() && strings.HasSuffix(info.Name(), ".md") {
-			relPath, _ := filepath.Rel(rootPath, path)
-			relPath = filepath.ToSlash(relPath)
 			content, _ := os.ReadFile(path)
-			if err := globalStore.IndexDocument(colName, relPath, string(content)); err != nil {
+			if err := globalStore.IndexDocument(col.Name, relPath, string(content)); err != nil {
 				log.Printf("Error indexing %s: %v", relPath, err)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		log.Printf("Error walking path %s: %v", rootPath, err)
+		log.Printf("Error walking path %s: %v", col.Path, err)
 	}
 }
