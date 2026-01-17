@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -16,6 +17,21 @@ type Server struct {
 	store *store.Store
 	llm   llm.Embedder
 	mcp   *server.MCPServer
+}
+
+// Internal structures for JSON responses
+type searchResultJSON struct {
+	Filepath string   `json:"filepath"`
+	Title    string   `json:"title"`
+	Score    float64  `json:"score"`
+	Snippet  string   `json:"snippet,omitempty"`
+	Matches  []string `json:"matches,omitempty"`
+}
+
+type statusJSON struct {
+	TotalDocuments int `json:"total_documents"`
+	Collections    int `json:"collections"`
+	Embeddings     int `json:"embeddings"`
 }
 
 func NewServer(s *store.Store, l llm.Embedder) *Server {
@@ -45,7 +61,7 @@ func (s *Server) Start() error {
 
 func (s *Server) registerTools() {
 	searchTool := mcp.NewTool("search",
-		mcp.WithDescription("Full text search using BM25. Use this for specific keywords."),
+		mcp.WithDescription("Full text search using BM25. Returns a JSON list of matches."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of documents to return")),
 		mcp.WithNumber("context_lines", mcp.DefaultNumber(1), mcp.Description("Number of lines to show before and after a match")),
@@ -58,32 +74,33 @@ func (s *Server) registerTools() {
 		contextLines := request.GetInt("context_lines", 1)
 		findAll := request.GetBool("find_all", false)
 
-		// Fixed: Passing all 4 arguments to SearchFTS
 		results, err := s.store.SearchFTS(query, limit, contextLines, findAll)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 		}
 
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
-		for _, r := range results {
-			sb.WriteString(fmt.Sprintf("## %s\n", r.Filepath))
-			if len(r.Matches) > 0 {
-				for _, match := range r.Matches {
-					sb.WriteString(fmt.Sprintf("%s\n...\n", match))
-				}
-			} else {
-				sb.WriteString(fmt.Sprintf("%s\n", r.Snippet))
+		resp := make([]searchResultJSON, len(results))
+		for i, r := range results {
+			resp[i] = searchResultJSON{
+				Filepath: r.Filepath,
+				Title:    r.Title,
+				Score:    r.Score,
+				Snippet:  r.Snippet,
+				Matches:  r.Matches,
 			}
-			sb.WriteString("\n")
 		}
 
-		return mcp.NewToolResultText(sb.String()), nil
+		jsonBytes, err := json.Marshal(resp)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("JSON marshal failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(jsonBytes)), nil
 	})
 
 	// Vector Search Tool
 	vsearchTool := mcp.NewTool("vsearch",
-		mcp.WithDescription("Semantic search using vector embeddings. Use this for concept search or when keywords miss."),
+		mcp.WithDescription("Semantic search using vector embeddings. Returns a JSON list of matches."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
 	)
@@ -103,19 +120,27 @@ func (s *Server) registerTools() {
 			return mcp.NewToolResultError(fmt.Sprintf("Vector search failed: %v", err)), nil
 		}
 
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
-		for _, r := range results {
-			// Score is similarity (0-1)
-			sb.WriteString(fmt.Sprintf("## %s (Score: %.2f)\n%s\n\n", r.Filepath, r.Score, r.Snippet))
+		resp := make([]searchResultJSON, len(results))
+		for i, r := range results {
+			resp[i] = searchResultJSON{
+				Filepath: r.Filepath,
+				Title:    r.Title,
+				Score:    r.Score,
+				Snippet:  r.Snippet,
+			}
 		}
 
-		return mcp.NewToolResultText(sb.String()), nil
+		jsonBytes, err := json.Marshal(resp)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("JSON marshal failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(jsonBytes)), nil
 	})
 
 	// Hybrid Query Tool
 	queryTool := mcp.NewTool("query",
-		mcp.WithDescription("Hybrid search using both keywords and semantic meaning (RRF). Combines BM25 and Vector search for best results."),
+		mcp.WithDescription("Hybrid search using both keywords and semantic meaning (RRF). Returns a JSON list of matches."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
 	)
@@ -139,21 +164,23 @@ func (s *Server) registerTools() {
 			return mcp.NewToolResultError(fmt.Sprintf("Hybrid search failed: %v", err)), nil
 		}
 
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
-		for _, r := range results {
-			sb.WriteString(fmt.Sprintf("## %s (Score: %.2f)\n", r.Filepath, r.Score))
-			if len(r.Matches) > 0 {
-				for _, match := range r.Matches {
-					sb.WriteString(fmt.Sprintf("%s\n...\n", match))
-				}
-			} else {
-				sb.WriteString(fmt.Sprintf("%s\n", r.Snippet))
+		resp := make([]searchResultJSON, len(results))
+		for i, r := range results {
+			resp[i] = searchResultJSON{
+				Filepath: r.Filepath,
+				Title:    r.Title,
+				Score:    r.Score,
+				Snippet:  r.Snippet,
+				Matches:  r.Matches,
 			}
-			sb.WriteString("\n")
 		}
 
-		return mcp.NewToolResultText(sb.String()), nil
+		jsonBytes, err := json.Marshal(resp)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("JSON marshal failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(jsonBytes)), nil
 	})
 
 	// Get Document Tool
@@ -182,7 +209,7 @@ func (s *Server) registerTools() {
 
 	// Status Tool
 	statusTool := mcp.NewTool("status",
-		mcp.WithDescription("Get the status of the qmd index"),
+		mcp.WithDescription("Get the status of the qmd index in JSON format"),
 	)
 
 	s.mcp.AddTool(statusTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -191,10 +218,18 @@ func (s *Server) registerTools() {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to get stats: %v", err)), nil
 		}
 
-		info := fmt.Sprintf("Total Documents: %d\nCollections: %d\nEmbeddings: %d",
-			stats.TotalDocuments, stats.Collections, stats.Embeddings)
+		sJSON := statusJSON{
+			TotalDocuments: stats.TotalDocuments,
+			Collections:    stats.Collections,
+			Embeddings:     stats.Embeddings,
+		}
 
-		return mcp.NewToolResultText(info), nil
+		jsonBytes, err := json.Marshal(sJSON)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("JSON marshal failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(jsonBytes)), nil
 	})
 }
 
