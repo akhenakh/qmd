@@ -507,10 +507,9 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		return nil, err
 	}
 
-	// OPTIMIZATION:
-	// 1. Use CTE (WITH clause) to force vector search to happen in isolation first.
-	// 2. Remove the join on 'content_vectors'.
-	// 3. Extract the hash directly from 'hash_seq' using substr (SHA256 hex is always 64 chars).
+	//  Use CTE (WITH clause) to force vector search to happen in isolation first.
+	//  Remove the join on 'content_vectors'.
+	//  Extract the hash directly from 'hash_seq' using substr (SHA256 hex is always 64 chars).
 	query := `
 		WITH vec_results AS (
 			SELECT hash_seq, distance
