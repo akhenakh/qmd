@@ -507,20 +507,29 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		return nil, err
 	}
 
-	rows, err := s.DB.Query(`
+	// OPTIMIZATION:
+	// 1. Use CTE (WITH clause) to force vector search to happen in isolation first.
+	// 2. Remove the join on 'content_vectors'.
+	// 3. Extract the hash directly from 'hash_seq' using substr (SHA256 hex is always 64 chars).
+	query := `
+		WITH vec_results AS (
+			SELECT hash_seq, distance
+			FROM vectors_vec
+			WHERE embedding MATCH ?
+			AND k = ?
+		)
 		SELECT
-			v.distance,
+			vr.distance,
 			d.collection || '/' || d.path,
 			d.title,
 			substr(c.doc, 1, 200)
-		FROM vectors_vec v
-		JOIN content_vectors cv ON v.hash_seq = cv.hash || '_' || cv.seq
-		JOIN documents d ON d.hash = cv.hash
+		FROM vec_results vr
+		JOIN documents d ON d.hash = substr(vr.hash_seq, 1, 64)
 		JOIN content c ON c.hash = d.hash
-		WHERE v.embedding MATCH ?
-		AND k = ?
-		ORDER BY v.distance
-	`, queryBlob, limit)
+		ORDER BY vr.distance
+	`
+
+	rows, err := s.DB.Query(query, queryBlob, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -532,6 +541,7 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Snippet); err != nil {
 			return nil, err
 		}
+		// Convert cosine distance to similarity score
 		r.Score = 1.0 - r.Score
 		results = append(results, r)
 	}
