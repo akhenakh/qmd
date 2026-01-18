@@ -5,12 +5,12 @@ go 1.25.5
 require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
 	github.com/hybridgroup/yzma v1.5.0
+	github.com/klauspost/compress v1.18.0
 	github.com/mark3labs/mcp-go v0.43.2
 	github.com/mattn/go-sqlite3 v1.14.33
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.10.0
 	github.com/tmc/langchaingo v0.1.14
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -37,4 +37,5 @@ require (
 	gitlab.com/golang-commonmark/puny v0.0.0-20191124015043-9f83538fa04f // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

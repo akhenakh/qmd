@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/akhenakh/qmd/internal/config"
+	"github.com/akhenakh/qmd/internal/ingest"
 	"github.com/akhenakh/qmd/internal/llm"
 	"github.com/akhenakh/qmd/internal/mcpserver"
 	"github.com/akhenakh/qmd/internal/store"
@@ -212,7 +213,7 @@ func main() {
 
 	var cmdAdd = &cobra.Command{
 		Use:   "add [path...]",
-		Short: "Add one or more folders as collections",
+		Short: "Add folders or compressed archives (.zst)",
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			var added []config.Collection
@@ -223,9 +224,26 @@ func main() {
 					log.Printf("Error resolving path %s: %v", arg, err)
 					continue
 				}
-				name := filepath.Base(absPath)
 
-				// Check if already exists
+				info, err := os.Stat(absPath)
+				if err != nil {
+					log.Printf("Error stating path %s: %v", absPath, err)
+					continue
+				}
+
+				// Determine Collection Name
+				baseName := filepath.Base(absPath)
+				name := baseName
+				// Strip extension for cleaner name if it's a file
+				if !info.IsDir() {
+					if idx := strings.Index(name, ".md"); idx != -1 {
+						name = name[:idx]
+					} else if idx := strings.Index(name, "."); idx != -1 {
+						name = name[:idx]
+					}
+				}
+
+				// Check if already exists in config
 				exists := false
 				for _, c := range globalConfig.Collections {
 					if c.Path == absPath {
@@ -238,25 +256,24 @@ func main() {
 					newCol := config.Collection{
 						Name:    name,
 						Path:    absPath,
-						Pattern: "**/*.md",
+						Pattern: "**/*.md", // Default pattern, ignored for archives
 						Exclude: excludePatterns,
 					}
 					globalConfig.Collections = append(globalConfig.Collections, newCol)
 					added = append(added, newCol)
 					fmt.Printf("Added collection '%s' at %s\n", name, absPath)
-					if len(excludePatterns) > 0 {
-						fmt.Printf("  Excluding: %v\n", excludePatterns)
-					}
 				} else {
 					fmt.Printf("Collection already exists: %s\n", absPath)
 				}
 			}
 
 			if len(added) > 0 {
+				// Save to DB
 				if err := globalStore.SaveConfig(globalConfig); err != nil {
 					log.Fatal(err)
 				}
-				// Reindex newly added collections
+
+				// Index them now
 				for _, col := range added {
 					reindex(col)
 				}
@@ -416,19 +433,19 @@ func main() {
 		},
 	}
 
-	// --- Hybrid Query Command ---
+	// Hybrid Query Command
 	var cmdQuery = &cobra.Command{
 		Use:   "query [query]",
 		Short: "Hybrid search (BM25 + Vector + RRF)",
 		Long:  "Performs a hybrid search combining Full-Text Search and Vector Search, ranking results using Reciprocal Rank Fusion.",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			// 1. Validation
+			// Validation
 			if !globalConfig.EmbeddingsConfigured {
 				log.Fatal("Embeddings not configured. Run 'qmd embed' first.")
 			}
 
-			// 2. Initialize Store & Embedder
+			// Initialize Store & Embedder
 			if globalStore == nil {
 				// Should be initialized by PersistentPreRun, but just in case
 				var err error
@@ -447,7 +464,7 @@ func main() {
 
 			query := args[0]
 
-			// 3. Generate Embedding for the query
+			// Generate Embedding for the query
 			// Note: We perform this synchronously. In a more advanced version with query expansion,
 			// we would generate multiple variations here.
 			fmt.Printf("Analyzing query: %q...\n", query)
@@ -456,13 +473,13 @@ func main() {
 				log.Fatal(err)
 			}
 
-			// 4. Perform Hybrid Search
+			// Perform Hybrid Search
 			results, err := globalStore.SearchHybrid(query, qVec, 10)
 			if err != nil {
 				log.Fatal(err)
 			}
 
-			// 5. Output Results
+			// Output Results
 			if len(results) == 0 {
 				fmt.Println("No results found.")
 				return
@@ -499,25 +516,41 @@ func main() {
 
 func reindex(col config.Collection) {
 	fmt.Printf("Indexing %s...\n", col.Name)
-	err := filepath.Walk(col.Path, func(path string, info os.FileInfo, err error) error {
+
+	info, err := os.Stat(col.Path)
+	if err != nil {
+		log.Printf("Error accessing collection path %s: %v", col.Path, err)
+		return
+	}
+
+	// 1. Handle Archives (Files)
+	if !info.IsDir() {
+		if strings.HasSuffix(col.Path, ".zst") || strings.HasSuffix(col.Path, ".zstd") {
+			// We pass the stored Collection Name to the ingestor so it matches the config
+			if err := ingest.ProcessZstdBundle(globalStore, col.Path, col.Name); err != nil {
+				log.Printf("Error ingesting archive %s: %v", col.Path, err)
+			}
+		}
+		return
+	}
+
+	// 2. Handle Directories (Existing Logic)
+	err = filepath.Walk(col.Path, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Calculate relative path for exclusion check
 		relPath, err := filepath.Rel(col.Path, path)
 		if err != nil {
 			return err
 		}
 		relPath = filepath.ToSlash(relPath)
 
-		// Check exclusion
-		if excluded, pattern := util.IsExcluded(relPath, col.Exclude); excluded {
+		if excluded, _ := util.IsExcluded(relPath, col.Exclude); excluded {
 			if info.IsDir() {
-				// fmt.Printf("Skipping excluded dir: %s (matches %s)\n", relPath, pattern)
 				return filepath.SkipDir
 			}
-			fmt.Printf("Skipping excluded file: %s (matches %s)\n", relPath, pattern)
+			// Verbose logging optional
 			return nil
 		}
 
