@@ -46,7 +46,7 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// 1. Detect Header: ```markdown path/file.md
+		// Detect Header: ```markdown path/file.md
 		if match := headerRegex.FindStringSubmatch(line); len(match) > 1 {
 			// Save previous file if exists
 			if inBlock && currentPath != "" {
@@ -64,7 +64,7 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 			continue
 		}
 
-		// 2. Detect Footer: ```
+		// Detect Footer: ```
 		// We check if line is EXACTLY ``` or starts with ``` and has no other chars
 		trimLine := strings.TrimSpace(line)
 		if inBlock && trimLine == "```" {
@@ -81,7 +81,7 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 			continue
 		}
 
-		// 3. Capture Content
+		// Capture Content
 		if inBlock {
 			currentContent.WriteString(line)
 			currentContent.WriteString("\n")
