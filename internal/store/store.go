@@ -538,26 +538,32 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 	return results, nil
 }
 
-func (s *Store) GetPendingEmbeddings() (map[string]string, error) {
+type PendingDoc struct {
+	Body  string
+	Title string
+}
+
+func (s *Store) GetPendingEmbeddings() (map[string]PendingDoc, error) {
+	// Join with documents table to get the Title
 	rows, err := s.DB.Query(`
-		SELECT DISTINCT d.hash, c.doc
-		FROM documents d
-		JOIN content c ON d.hash = c.hash
-		LEFT JOIN content_vectors cv ON d.hash = cv.hash
-		WHERE cv.hash IS NULL
-	`)
+        SELECT DISTINCT d.hash, d.title, c.doc
+        FROM documents d
+        JOIN content c ON d.hash = c.hash
+        LEFT JOIN content_vectors cv ON d.hash = cv.hash
+        WHERE cv.hash IS NULL
+    `)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	res := make(map[string]string)
+	res := make(map[string]PendingDoc)
 	for rows.Next() {
-		var hash, body string
-		if err := rows.Scan(&hash, &body); err != nil {
+		var hash, title, body string
+		if err := rows.Scan(&hash, &title, &body); err != nil {
 			return nil, err
 		}
-		res[hash] = body
+		res[hash] = PendingDoc{Body: body, Title: title}
 	}
 	return res, nil
 }

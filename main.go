@@ -64,10 +64,12 @@ func generateEmbeddings() {
 	}
 	defer embedder.Close()
 
+	// Update variable type based on Store change
 	pending, err := globalStore.GetPendingEmbeddings()
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	if len(pending) == 0 {
 		fmt.Println("No pending embeddings.")
 		return
@@ -78,10 +80,22 @@ func generateEmbeddings() {
 	splitter := textsplitter.NewMarkdownTextSplitter(
 		textsplitter.WithChunkSize(globalConfig.ChunkSize),
 		textsplitter.WithChunkOverlap(globalConfig.ChunkOverlap),
+		textsplitter.WithHeadingHierarchy(true),
 	)
 
-	for hash, content := range pending {
-		chunks, err := splitter.SplitText(content)
+	for hash, doc := range pending {
+		contentToSplit := doc.Body
+
+		// Ensure the document starts with the Title as H1.
+		// If the Title is "Project Alpha" and content doesn't start with "# Project Alpha",
+		// we prepend it. This forces the splitter to treat the Title as the root context
+		// for ALL chunks in this file.
+		titleHeader := fmt.Sprintf("# %s", doc.Title)
+		if !strings.Contains(doc.Body, titleHeader) {
+			contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, doc.Body)
+		}
+
+		chunks, err := splitter.SplitText(contentToSplit)
 		if err != nil {
 			log.Printf("Error splitting: %v", err)
 			continue
