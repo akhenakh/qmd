@@ -9,6 +9,7 @@ You can generate embeddings using either an **Ollama** server or **Local Inferen
 - **Full-Text Search**: Fast keyword search using BM25 with context extraction.
 - **Vector Search**: Semantic search using embeddings (Ollama or Local).
 - **Hybrid Search**: Combines keyword and semantic search using Reciprocal Rank Fusion (RRF) for highest accuracy.
+- **Archive Support**: Index massive documentation sets directly from Zstandard compressed archives (`.zst`/`.zstd`) without decompression, compatible with [fcopy](https://github.com/akhenakh/fcopy).
 - **Smart Splitting**: Uses context-aware Markdown splitting (via LangChainGo) for better embedding quality.
 - **MCP Server**: Exposes search capabilities via the [Model Context Protocol](https://modelcontextprotocol.io), allowing AI assistants (like Claude Desktop) to search your notes.
 - **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default), so that you can point to different db for different purposes.
@@ -73,10 +74,10 @@ go build -tags sqlite_fts5
 
 ### 1. Index Notes
 
-Add one or more directories containing markdown files.
+Add one or more directories containing markdown files, or single compressed archives.
 
 ```bash
-qmd add ./example ~/Documents/Obsidian
+qmd add ./example ~/Documents/Obsidian ./docs/bento-v1.md.zst
 ```
 
 ### 2. Full-Text Search
@@ -123,9 +124,18 @@ qmd query "quarterly planning process"
 ### Commands
 
 #### `add [path...]`
-Adds folders to the index configuration. It recursively scans for `.md` files.
+Adds folders or archives to the index configuration.
+- **Directories**: Recursively scans for `.md` files.
+- **Archives**: Indexes `.zst` or `.zstd` files.
+    - **Format Requirement**: The archive must contain concatenated markdown files, delimited by code blocks specifying the relative path.
+      ```markdown
+      ```markdown path/to/file.md
+      # File Content
+      ```
+      ```
+
 ```bash
-qmd add ~/Notes ~/Work/Docs
+qmd add ~/Notes ./docs/large-docs.md.zst
 ```
 
 #### `update`
@@ -173,6 +183,7 @@ Starts the Model Context Protocol (MCP) server for integration with AI agents.
 
 Connect `qmd` to AI agents like Claude Desktop.
 
+### Claude
 **`claude_desktop_config.json`:**
 
 ```json
@@ -184,6 +195,21 @@ Connect `qmd` to AI agents like Claude Desktop.
     }
   }
 }
+```
+
+### Mistral Vibe
+
+```toml
+[[mcp_servers]]
+name = "qmd"
+transport = "stdio"
+command = "/absolute/path/to/qmd"
+args = [
+    "server",
+    "--db",
+    "/absolute/path/to/qmd.sqlite",
+]
+prompt = "Use qmd to search through indexed markdown notes and documentation. It supports semantic search. Use the 'query' tool for most questions as it combines keyword and vector search for best results. Use 'get_document' to read the full content of a file found via search."
 ```
 
 ### Exposed Tools
