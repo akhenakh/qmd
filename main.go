@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/akhenakh/qmd/internal/chat"
 	"github.com/akhenakh/qmd/internal/config"
 	"github.com/akhenakh/qmd/internal/ingest"
 	"github.com/akhenakh/qmd/internal/llm"
@@ -33,6 +35,10 @@ var (
 	findAll      bool
 
 	excludePatterns []string
+
+	// Chat flags
+	chatURL   string
+	chatModel string
 
 	// Global instances
 	globalStore  *store.Store
@@ -400,11 +406,40 @@ func main() {
 				log.Fatal(err)
 			}
 
+			// Initialize splitter if context is requested to reconstruct chunks
+			var splitter textsplitter.TextSplitter
+			if contextLines > 0 {
+				splitter = textsplitter.NewMarkdownTextSplitter(
+					textsplitter.WithChunkSize(globalConfig.ChunkSize),
+					textsplitter.WithChunkOverlap(globalConfig.ChunkOverlap),
+					textsplitter.WithHeadingHierarchy(true),
+				)
+			}
+
 			for _, r := range results {
-				fmt.Printf("[%.4f] %s - %s\n", r.Score, r.Filepath, r.Title)
+				fmt.Printf("[%.4f] \033[1;36m%s\033[0m - %s\n", r.Score, r.Filepath, r.Title)
+
+				if contextLines > 0 {
+					// We need to re-split the document to find the specific chunk that matched
+					contentToSplit := r.Body
+					// Ensure header logic matches generateEmbeddings
+					titleHeader := fmt.Sprintf("# %s", r.Title)
+					if !strings.Contains(r.Body, titleHeader) {
+						contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, r.Body)
+					}
+
+					chunks, err := splitter.SplitText(contentToSplit)
+					if err == nil && r.Seq < len(chunks) {
+						fmt.Printf("   %s\n\n", strings.ReplaceAll(chunks[r.Seq], "\n", " "))
+					} else {
+						// Fallback if splitting fails or index out of bounds
+						fmt.Printf("   (Context unavailable: chunk %d/%d)\n\n", r.Seq, len(chunks))
+					}
+				}
 			}
 		},
 	}
+	cmdVSearch.Flags().IntVarP(&contextLines, "context", "C", 0, "Show the matching chunk content")
 
 	var cmdServer = &cobra.Command{
 		Use:   "server",
@@ -424,7 +459,8 @@ func main() {
 				log.Println("Embeddings not configured. Vector search unavailable.")
 			}
 
-			mcpSrv := mcpserver.NewServer(globalStore, embedder)
+			// Pass Global Config to Server
+			mcpSrv := mcpserver.NewServer(globalStore, embedder, globalConfig)
 
 			log.SetOutput(os.Stderr)
 			if err := mcpSrv.Start(); err != nil {
@@ -474,7 +510,8 @@ func main() {
 			}
 
 			// Perform Hybrid Search
-			results, err := globalStore.SearchHybrid(query, qVec, 10)
+			// Defaulting to 1 context line for CLI usage to maintain previous behavior
+			results, err := globalStore.SearchHybrid(query, qVec, 10, 1)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -508,7 +545,45 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdInfo, cmdEmbed, cmdSearch, cmdVSearch, cmdQuery, cmdServer)
+	var cmdChat = &cobra.Command{
+		Use:   "chat",
+		Short: "Chat with your notes using Ollama and MCP tools",
+		Run: func(cmd *cobra.Command, args []string) {
+			// Reuse the already initialized globalStore
+			// PersistentPreRun initialized it
+
+			var embedder llm.Embedder
+			var err error
+
+			if globalConfig.EmbeddingsConfigured {
+				embedder, err = getEmbedder()
+				if err != nil {
+					log.Printf("Warning: Failed to initialize embedder: %v. Vector search tool will fail.", err)
+				} else {
+					defer embedder.Close()
+				}
+			}
+
+			// Initialize Internal MCP Server with config
+			mcpSrv := mcpserver.NewServer(globalStore, embedder, globalConfig)
+
+			// Initialize Chat Session
+			session, err := chat.NewSession(chatURL, chatModel, globalStore, mcpSrv)
+			if err != nil {
+				log.Fatalf("Failed to initialize chat session: %v", err)
+			}
+
+			// Start Chat Loop
+			if err := session.Start(context.Background()); err != nil {
+				log.Fatal(err)
+			}
+		},
+	}
+
+	cmdChat.Flags().StringVarP(&chatURL, "url", "u", "http://127.0.0.1:11434", "Ollama server URL")
+	cmdChat.Flags().StringVarP(&chatModel, "model", "m", "llama3", "Ollama model name to use")
+
+	rootCmd.AddCommand(cmdAdd, cmdUpdate, cmdInfo, cmdEmbed, cmdSearch, cmdVSearch, cmdQuery, cmdServer, cmdChat)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

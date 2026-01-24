@@ -22,7 +22,8 @@ func NewHTTPClient(baseURL, model string, targetDim int) *HTTPClient {
 		Model:     model,
 		TargetDim: targetDim,
 		HTTPClient: &http.Client{
-			Timeout: 60 * time.Second,
+			// Increased timeout to 5 minutes for large contexts/slow models
+			Timeout: 300 * time.Second,
 		},
 	}
 }

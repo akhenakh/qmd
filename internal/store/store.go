@@ -327,6 +327,8 @@ type SearchResult struct {
 	Snippet  string
 	Score    float64
 	Matches  []string
+	Body     string // Full content for context extraction
+	Seq      int    // Sequence number of the matching chunk (for vector search)
 }
 
 func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll bool) ([]SearchResult, error) {
@@ -508,8 +510,9 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 	}
 
 	//  Use CTE (WITH clause) to force vector search to happen in isolation first.
-	//  Remove the join on 'content_vectors'.
-	//  Extract the hash directly from 'hash_seq' using substr (SHA256 hex is always 64 chars).
+	//  We extract the seq (chunk index) from the hash_seq key.
+	//  The key format is "hash_seq". Hash is 64 chars (sha256 hex).
+	//  So the sequence number starts at index 66 (1-based SQL substr index: 1..64 is hash, 65 is '_', 66+ is seq).
 	query := `
 		WITH vec_results AS (
 			SELECT hash_seq, distance
@@ -521,7 +524,8 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 			vr.distance,
 			d.collection || '/' || d.path,
 			d.title,
-			substr(c.doc, 1, 200)
+			c.doc,
+			cast(substr(vr.hash_seq, 66) as integer) as seq
 		FROM vec_results vr
 		JOIN documents d ON d.hash = substr(vr.hash_seq, 1, 64)
 		JOIN content c ON c.hash = d.hash
@@ -537,11 +541,19 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Snippet); err != nil {
+		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Body, &r.Seq); err != nil {
 			return nil, err
 		}
 		// Convert cosine distance to similarity score
 		r.Score = 1.0 - r.Score
+
+		// Default snippet (first 200 chars) in case caller doesn't re-process
+		if len(r.Body) > 200 {
+			r.Snippet = r.Body[:200] + "..."
+		} else {
+			r.Snippet = r.Body
+		}
+
 		results = append(results, r)
 	}
 	return results, nil
@@ -633,14 +645,16 @@ func (s *Store) GetStats() (*Stats, error) {
 
 // SearchHybrid performs both FTS and Vector search and combines them using RRF.
 // It fetches more candidates (limit * 2) from each source to ensure good intersection.
-func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int) ([]SearchResult, error) {
+// SearchHybrid performs both FTS and Vector search and combines them using RRF.
+// It fetches more candidates (limit * 2) from each source to ensure good intersection.
+func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int, contextLines int) ([]SearchResult, error) {
 	// Run searches in parallel (mocked here by sequential for simplicity, or use goroutines)
 	// We ask for more results (2x limit) from individual engines to improve fusion quality
 	candidateLimit := limit * 2
 
 	// FTS Search
-	// We request 1 line of context by default for snippets
-	ftsResults, err := s.SearchFTS(textQuery, candidateLimit, 1, false)
+	// Pass contextLines through to FTS
+	ftsResults, err := s.SearchFTS(textQuery, candidateLimit, contextLines, false)
 	if err != nil {
 		return nil, fmt.Errorf("FTS search failed: %w", err)
 	}
