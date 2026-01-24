@@ -1,85 +1,56 @@
 package chat
 
-import (
-	"encoding/json"
-	"fmt"
-)
-
-// OllamaRequest represents the payload sent to Ollama
-type OllamaRequest struct {
-	Model    string         `json:"model"`
-	Messages []Message      `json:"messages"`
-	Tools    []ToolDef      `json:"tools,omitempty"`
-	Stream   bool           `json:"stream"`
-	Options  map[string]any `json:"options,omitempty"`
-}
-
-// Message represents a chat message
+// Message represents a chat message in the format expected by Ollama/OpenAI
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"` // For role: tool response linkage
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
+
+	// ToolCalls fields (for role: assistant)
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+
+	// ToolResult fields (for role: tool)
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Name       string `json:"name,omitempty"`
 }
 
-// ToolDef represents a tool definition passed to Ollama
+type ToolCall struct {
+	Function FunctionCall `json:"function"`
+	ID       string       `json:"id,omitempty"`
+	Type     string       `json:"type,omitempty"`
+}
+
+type FunctionCall struct {
+	Name      string      `json:"name"`
+	Arguments interface{} `json:"arguments"`
+}
+
+type ChatRequest struct {
+	Model    string                 `json:"model"`
+	Messages []Message              `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Tools    []ToolDef              `json:"tools,omitempty"`
+	Options  map[string]interface{} `json:"options,omitempty"`
+}
+
 type ToolDef struct {
-	Type     string       `json:"type"`
-	Function ToolFunction `json:"function"`
+	Type     string   `json:"type"`
+	Function ToolFunc `json:"function"`
 }
 
-type ToolFunction struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  json.RawMessage `json:"parameters"`
+type ToolFunc struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
 }
 
-type ToolCallFunc struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
-}
+type ChatResponse struct {
+	Model   string  `json:"model"`
+	Message Message `json:"message"`
+	Done    bool    `json:"done"`
 
-// UnmarshalJSON implements custom unmarshaling to handle both string and object formats for arguments
-func (t *ToolCallFunc) UnmarshalJSON(data []byte) error {
-	// Define a shadow struct to avoid recursion
-	type Alias ToolCallFunc
-	aux := &struct {
-		Arguments interface{} `json:"arguments"`
-		*Alias
-	}{
-		Alias: (*Alias)(t),
-	}
-
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-
-	// Handle Arguments based on type
-	switch v := aux.Arguments.(type) {
-	case string:
-		// OpenAI style: JSON string encoded inside the field
-		if v == "" {
-			t.Arguments = make(map[string]any)
-			return nil
-		}
-		if err := json.Unmarshal([]byte(v), &t.Arguments); err != nil {
-			return fmt.Errorf("failed to parse tool arguments string: %w", err)
-		}
-	case map[string]interface{}:
-		// Ollama style: JSON object
-		t.Arguments = v
-	default:
-		// nil or other, initialize empty
-		t.Arguments = make(map[string]any)
-	}
-
-	return nil
-}
-
-// OllamaResponse represents the response from Ollama
-type OllamaResponse struct {
-	Model     string  `json:"model"`
-	CreatedAt string  `json:"created_at"`
-	Message   Message `json:"message"`
-	Done      bool    `json:"done"`
+	// Support for OpenAI-compatible responses (used by some llama-server versions)
+	Choices []struct {
+		Message Message `json:"message"`
+	} `json:"choices"`
 }
