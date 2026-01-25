@@ -25,6 +25,12 @@ type FunctionCall struct {
 	Arguments interface{} `json:"arguments"`
 }
 
+// ToolExecutionLog contains details about a tool execution for UI display
+type ToolExecutionLog struct {
+	Name string
+	Args map[string]interface{}
+}
+
 type ChatRequest struct {
 	Model    string                 `json:"model"`
 	Messages []Message              `json:"messages"`

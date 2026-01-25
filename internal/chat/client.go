@@ -46,12 +46,14 @@ func NewOllamaClient(url, model string, mcp *mcpserver.Server) *OllamaClient {
 	}
 }
 
-func (c *OllamaClient) Chat(userPrompt string) (string, error) {
+// Chat returns content, a list of tools executed, and error
+func (c *OllamaClient) Chat(userPrompt string) (string, []ToolExecutionLog, error) {
 	// 1. Append User Message
 	c.Messages = append(c.Messages, Message{Role: "user", Content: userPrompt})
 
 	var finalContent string
 	var toolCallsMade bool
+	var executionLogs []ToolExecutionLog
 
 	// Max turns loop
 	for i := 0; i < 5; i++ {
@@ -67,25 +69,25 @@ func (c *OllamaClient) Chat(userPrompt string) (string, error) {
 
 		jsonBody, err := json.Marshal(reqBody)
 		if err != nil {
-			return "", fmt.Errorf("marshal error: %w", err)
+			return "", nil, fmt.Errorf("marshal error: %w", err)
 		}
 
 		resp, err := c.Client.Post(c.BaseURL+"/api/chat", "application/json", bytes.NewBuffer(jsonBody))
 		if err != nil {
-			return "", fmt.Errorf("network error: %w", err)
+			return "", nil, fmt.Errorf("network error: %w", err)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			return "", fmt.Errorf("ollama API error: %s", resp.Status)
+			return "", nil, fmt.Errorf("ollama API error: %s", resp.Status)
 		}
 
 		var chatResp ChatResponse
 		if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-			return "", fmt.Errorf("decode error: %w", err)
+			return "", nil, fmt.Errorf("decode error: %w", err)
 		}
 
-		// Normalize Response: Handle OpenAI-style 'choices' vs Ollama-style 'message'
+		// Normalize Response
 		var respMessage Message
 		if len(chatResp.Choices) > 0 {
 			respMessage = chatResp.Choices[0].Message
@@ -93,31 +95,29 @@ func (c *OllamaClient) Chat(userPrompt string) (string, error) {
 			respMessage = chatResp.Message
 		}
 
-		// 2. Append Assistant Response (stores arguments exactly as received)
+		// 2. Append Assistant Response
 		c.Messages = append(c.Messages, respMessage)
 
 		// Check if we are done (no tool calls)
 		if len(respMessage.ToolCalls) == 0 {
 			finalContent = respMessage.Content
 
-			// Fix empty content issues
 			if finalContent == "" {
 				if toolCallsMade {
 					finalContent = "(Model finished execution but returned no summary text)"
 				} else {
 					finalContent = "(Model returned empty response)"
 				}
-				// Update the history so next turn sees content
 				c.Messages[len(c.Messages)-1].Content = finalContent
 			}
 
-			return finalContent, nil
+			return finalContent, executionLogs, nil
 		}
 
 		// 3. Handle Tool Calls
 		toolCallsMade = true
 		for _, tc := range respMessage.ToolCalls {
-			// Dynamic Argument Parsing
+			// Parse Arguments
 			var args map[string]interface{}
 			switch v := tc.Function.Arguments.(type) {
 			case string:
@@ -136,6 +136,12 @@ func (c *OllamaClient) Chat(userPrompt string) (string, error) {
 			default:
 				args = make(map[string]interface{})
 			}
+
+			// Log execution for UI
+			executionLogs = append(executionLogs, ToolExecutionLog{
+				Name: tc.Function.Name,
+				Args: args,
+			})
 
 			// Execute Tool
 			res, err := c.MCP.CallTool(context.Background(), tc.Function.Name, args)
@@ -169,8 +175,8 @@ func (c *OllamaClient) Chat(userPrompt string) (string, error) {
 	if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Role == "tool" {
 		fallback := "(Conversation turn limit reached)"
 		c.Messages = append(c.Messages, Message{Role: "assistant", Content: fallback})
-		return fallback, fmt.Errorf("max conversation turns exceeded")
+		return fallback, nil, fmt.Errorf("max conversation turns exceeded")
 	}
 
-	return "", fmt.Errorf("unexpected chat state")
+	return "", nil, fmt.Errorf("unexpected chat state")
 }
