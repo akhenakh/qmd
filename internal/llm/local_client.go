@@ -120,7 +120,8 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 		prompt = prefix + text
 	}
 
-	util.Debug("LLM [Local] Embed Request. IsQuery: %v, TextLen: %d", isQuery, len(text))
+	// Log Raw Query
+	util.Debug("LLM [Local] Raw Prompt:\n%s", prompt)
 
 	vocab := llama.ModelGetVocab(c.Model)
 
@@ -137,8 +138,7 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 	// Create batch
 	batch := llama.BatchGetOne(tokens)
 
-	// Clear the KV cache. This is crucial for embeddings generation using Decode (decoder-only models like Qwen/Llama).
-	// Without clearing, the context fills up with tokens from previous documents, causing "failed to find a memory slot" errors.
+	// Clear the KV cache.
 	mem, _ := llama.GetMemory(c.Context)
 	llama.MemoryClear(mem, true)
 
@@ -163,20 +163,17 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 
 	// Get Embeddings
 	nEmbd := llama.ModelNEmbd(c.Model)
-	// For pooling type Mean, we usually look at the sequence.
-	// GetEmbeddingsSeq returns the embedding for the sequence 0.
 	vec, err := llama.GetEmbeddingsSeq(c.Context, 0, nEmbd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get embeddings: %w", err)
 	}
 
-	// Handle Matryoshka Truncation (if target dim is smaller than model output)
+	// Handle Matryoshka Truncation
 	if c.TargetDim > 0 && len(vec) > c.TargetDim {
-		util.Debug("LLM [Local] Truncating vector from %d to %d", len(vec), c.TargetDim)
 		vec = vec[:c.TargetDim]
 	}
 
-	// Normalize (Cosine Similarity requires normalized vectors)
+	// Normalize
 	var sum float64
 	for _, v := range vec {
 		sum += float64(v * v)
@@ -192,7 +189,7 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 		normalized[i] = v * norm
 	}
 
-	util.Debug("LLM [Local] Generated vector. Dim: %d", len(normalized))
+	util.Debug("LLM [Local] Generated Vector (Dim: %d)", len(normalized))
 	return normalized, nil
 }
 

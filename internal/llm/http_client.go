@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"time"
@@ -48,8 +49,6 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 	}
 	prompt := prefix + text
 
-	util.Debug("LLM [HTTP] Embed Request. Model: %s, IsQuery: %v, TextLen: %d", c.Model, isQuery, len(text))
-
 	reqBody := EmbedRequest{
 		Model:  c.Model,
 		Prompt: prompt,
@@ -60,26 +59,39 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 		return nil, err
 	}
 
+	// Log Raw Request
+	util.Debug("LLM [HTTP] Request Payload:\n%s", string(jsonData))
+
 	// Adjust endpoint based on provider (Ollama example)
 	resp, err := c.HTTPClient.Post(c.BaseURL+"/api/embeddings", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		util.Debug("LLM [HTTP] Error: %v", err)
+		util.Debug("LLM [HTTP] Connection Error: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		util.Debug("LLM [HTTP] API Error: %s", resp.Status)
+		util.Debug("LLM [HTTP] API Status Error: %s", resp.Status)
 		return nil, fmt.Errorf("API returned status: %s", resp.Status)
 	}
 
+	// Read Body for Logging
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Log Raw Response
+	// Note: This can be very large due to vector arrays
+	util.Debug("LLM [HTTP] Response Payload:\n%s", string(bodyBytes))
+
+	// Decode
 	var result EmbedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
 		return nil, err
 	}
 
 	vec := result.Embedding
-	util.Debug("LLM [HTTP] Embed Response. Vector Dim: %d", len(vec))
 
 	// Handle Matryoshka Truncation
 	if c.TargetDim > 0 && len(vec) > c.TargetDim {

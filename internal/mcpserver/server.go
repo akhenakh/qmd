@@ -107,14 +107,9 @@ func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
 		if err != nil {
 			util.Debug("MCP Tool Error [%s]: %v", request.Params.Name, err)
 		} else {
-			// Don't log full content, just metadata
-			contentLen := 0
-			if len(res.Content) > 0 {
-				if txt, ok := res.Content[0].(mcp.TextContent); ok {
-					contentLen = len(txt.Text)
-				}
-			}
-			util.Debug("MCP Tool Result [%s]: Success (Content Length: %d)", request.Params.Name, contentLen)
+			// Log Raw Response Content
+			jsonRes, _ := json.Marshal(res)
+			util.Debug("MCP Tool Result [%s]:\n%s", request.Params.Name, string(jsonRes))
 		}
 		return res, err
 	}
