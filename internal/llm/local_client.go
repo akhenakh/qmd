@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/akhenakh/qmd/internal/util"
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
 
@@ -94,6 +95,8 @@ func NewLocalClient(modelFile, libPath string, targetDim int) (*LocalClient, err
 		return nil, fmt.Errorf("unable to initialize context: %v", err)
 	}
 
+	util.Debug("LLM [Local] Initialized. Model: %s, UseEncode: %v, MaxTokens: %d", modelFile, useEncode, maxTokens)
+
 	return &LocalClient{
 		ModelFile: modelFile,
 		LibPath:   libPath,
@@ -117,6 +120,8 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 		prompt = prefix + text
 	}
 
+	util.Debug("LLM [Local] Embed Request. IsQuery: %v, TextLen: %d", isQuery, len(text))
+
 	vocab := llama.ModelGetVocab(c.Model)
 
 	// Tokenize (true for add_bos, true for special tokens)
@@ -125,7 +130,7 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 	// SAFETY: Truncate tokens to MaxTokens to prevent llama.cpp assertion crash.
 	// The assertion `GGML_ASSERT(n_ubatch >= n_tokens)` fails if input is too long.
 	if len(tokens) > c.MaxTokens {
-		// Log warning if needed, but for now silent truncation is standard for embeddings
+		util.Debug("LLM [Local] Truncating tokens from %d to %d", len(tokens), c.MaxTokens)
 		tokens = tokens[:c.MaxTokens]
 	}
 
@@ -148,9 +153,11 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 	}
 
 	if err != nil {
+		util.Debug("LLM [Local] Error processing: %v", err)
 		return nil, fmt.Errorf("llama processing failed: %w", err)
 	}
 	if ret != 0 {
+		util.Debug("LLM [Local] Error processing code: %d", ret)
 		return nil, fmt.Errorf("llama processing failed with code %d", ret)
 	}
 
@@ -165,6 +172,7 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 
 	// Handle Matryoshka Truncation (if target dim is smaller than model output)
 	if c.TargetDim > 0 && len(vec) > c.TargetDim {
+		util.Debug("LLM [Local] Truncating vector from %d to %d", len(vec), c.TargetDim)
 		vec = vec[:c.TargetDim]
 	}
 
@@ -184,6 +192,7 @@ func (c *LocalClient) Embed(text string, isQuery bool) ([]float32, error) {
 		normalized[i] = v * norm
 	}
 
+	util.Debug("LLM [Local] Generated vector. Dim: %d", len(normalized))
 	return normalized, nil
 }
 

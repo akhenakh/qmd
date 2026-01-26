@@ -9,11 +9,15 @@ import (
 	"github.com/akhenakh/qmd/internal/config"
 	"github.com/akhenakh/qmd/internal/llm"
 	"github.com/akhenakh/qmd/internal/store"
+	"github.com/akhenakh/qmd/internal/util"
 	"github.com/tmc/langchaingo/textsplitter"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// 5KB Threshold for returning full document content
+const maxFullContextSize = 5120
 
 type Server struct {
 	store  *store.Store
@@ -89,15 +93,37 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]inte
 		},
 	}
 
+	// Logging wrapper handled inside addTool
 	return handler(ctx, req)
 }
 
 func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
+	// Wrap handler for logging interactions
+	wrappedHandler := func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		util.Debug("MCP Tool Request [%s]: args=%v", request.Params.Name, request.Params.Arguments)
+
+		res, err := handler(ctx, request)
+
+		if err != nil {
+			util.Debug("MCP Tool Error [%s]: %v", request.Params.Name, err)
+		} else {
+			// Don't log full content, just metadata
+			contentLen := 0
+			if len(res.Content) > 0 {
+				if txt, ok := res.Content[0].(mcp.TextContent); ok {
+					contentLen = len(txt.Text)
+				}
+			}
+			util.Debug("MCP Tool Result [%s]: Success (Content Length: %d)", request.Params.Name, contentLen)
+		}
+		return res, err
+	}
+
 	// Register with the actual MCP server for external agents
-	s.mcp.AddTool(tool, handler)
+	s.mcp.AddTool(tool, wrappedHandler)
 	// Store locally for internal chat
 	s.toolDefs = append(s.toolDefs, tool)
-	s.toolHandlers[tool.Name] = handler
+	s.toolHandlers[tool.Name] = wrappedHandler
 }
 
 func (s *Server) registerTools() {
@@ -122,11 +148,17 @@ func (s *Server) registerTools() {
 
 		resp := make([]searchResultJSON, len(results))
 		for i, r := range results {
+			// Context Logic: Small files get full content
+			snippet := r.Snippet
+			if r.Size < maxFullContextSize {
+				snippet = r.Body
+			}
+
 			resp[i] = searchResultJSON{
 				Filepath: r.Filepath,
 				Title:    r.Title,
 				Score:    r.Score,
-				Snippet:  r.Snippet,
+				Snippet:  snippet,
 				Matches:  r.Matches,
 			}
 		}
@@ -172,22 +204,29 @@ func (s *Server) registerTools() {
 
 		resp := make([]searchResultJSON, len(results))
 		for i, r := range results {
-			// Re-split logic to find the specific chunk
-			snippet := r.Snippet // Default to beginning/summary if splitting fails
-			contentToSplit := r.Body
-			titleHeader := fmt.Sprintf("# %s", r.Title)
-			if !strings.Contains(r.Body, titleHeader) {
-				contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, r.Body)
-			}
+			var snippet string
 
-			chunks, err := splitter.SplitText(contentToSplit)
-			if err == nil && r.Seq < len(chunks) {
-				chunkText := chunks[r.Seq]
-				if contextLines > 0 {
-					// Expand context around the chunk
-					snippet = extractContext(r.Body, chunkText, contextLines)
-				} else {
-					snippet = chunkText
+			// Context Logic: Small files get full content
+			if r.Size < maxFullContextSize {
+				snippet = r.Body
+			} else {
+				// Large files get specific chunk + context
+				snippet = r.Snippet // Default to beginning/summary if splitting fails
+				contentToSplit := r.Body
+				titleHeader := fmt.Sprintf("# %s", r.Title)
+				if !strings.Contains(r.Body, titleHeader) {
+					contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, r.Body)
+				}
+
+				chunks, err := splitter.SplitText(contentToSplit)
+				if err == nil && r.Seq < len(chunks) {
+					chunkText := chunks[r.Seq]
+					if contextLines > 0 {
+						// Expand context around the chunk
+						snippet = extractContext(r.Body, chunkText, contextLines)
+					} else {
+						snippet = chunkText
+					}
 				}
 			}
 
@@ -245,29 +284,35 @@ func (s *Server) registerTools() {
 
 		resp := make([]searchResultJSON, len(results))
 		for i, r := range results {
-			// If we have matches (from FTS), the context is already handled by SearchFTS.
-			// If no matches, it implies this result came primarily from Vector search,
-			// so we need to generate the snippet from the chunk + context.
-			finalSnippet := r.Snippet
+			var finalSnippet string
 
-			if len(r.Matches) == 0 && r.Body != "" {
-				contentToSplit := r.Body
-				titleHeader := fmt.Sprintf("# %s", r.Title)
-				if !strings.Contains(r.Body, titleHeader) {
-					contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, r.Body)
-				}
-				chunks, err := splitter.SplitText(contentToSplit)
-				if err == nil && r.Seq < len(chunks) {
-					chunkText := chunks[r.Seq]
-					if contextLines > 0 {
-						finalSnippet = extractContext(r.Body, chunkText, contextLines)
-					} else {
-						finalSnippet = chunkText
+			// Context Logic: Small files get full content
+			if r.Size < maxFullContextSize {
+				finalSnippet = r.Body
+			} else {
+				// Large files logic
+				finalSnippet = r.Snippet
+
+				if len(r.Matches) == 0 && r.Body != "" {
+					// Vector result -> chunk extraction
+					contentToSplit := r.Body
+					titleHeader := fmt.Sprintf("# %s", r.Title)
+					if !strings.Contains(r.Body, titleHeader) {
+						contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, r.Body)
 					}
+					chunks, err := splitter.SplitText(contentToSplit)
+					if err == nil && r.Seq < len(chunks) {
+						chunkText := chunks[r.Seq]
+						if contextLines > 0 {
+							finalSnippet = extractContext(r.Body, chunkText, contextLines)
+						} else {
+							finalSnippet = chunkText
+						}
+					}
+				} else if len(r.Matches) > 0 {
+					// FTS result -> matches context
+					finalSnippet = r.Matches[0]
 				}
-			} else if len(r.Matches) > 0 {
-				// If we have FTS matches, use the first match which contains context
-				finalSnippet = r.Matches[0]
 			}
 
 			resp[i] = searchResultJSON{

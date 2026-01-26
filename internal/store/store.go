@@ -78,6 +78,7 @@ func (s *Store) initBasicSchema() error {
 			path TEXT NOT NULL,
 			title TEXT NOT NULL,
 			hash TEXT NOT NULL,
+			size INTEGER NOT NULL DEFAULT 0,
 			active INTEGER NOT NULL DEFAULT 1,
 			modified_at TEXT NOT NULL,
 			FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
@@ -116,11 +117,14 @@ func (s *Store) initBasicSchema() error {
 
 	for _, q := range queries {
 		if _, err := s.DB.Exec(q); err != nil {
-			// Handle schema migration for existing DBs simply by ignoring error or checking column
-			// Ideally proper migration, but for this snippet we assume "if not exists" handles creation
-			// To support adding column to existing table:
+			// Migration logic
+			// Support adding column to existing table:
 			if strings.Contains(q, "collections") {
 				s.DB.Exec("ALTER TABLE collections ADD COLUMN exclude TEXT")
+			}
+			if strings.Contains(q, "documents") && strings.Contains(err.Error(), "already exists") {
+				// Attempt to add size column if missing
+				s.DB.Exec("ALTER TABLE documents ADD COLUMN size INTEGER NOT NULL DEFAULT 0")
 			}
 		}
 	}
@@ -190,8 +194,6 @@ func (s *Store) LoadConfig() (*config.Config, error) {
 	}
 
 	// Load Collections
-	// We handle the case where exclude column might not exist in older DBs
-	// via basic query logic or explicit selection
 	cRows, err := s.DB.Query("SELECT path, name, pattern, exclude, context FROM collections")
 	if err != nil {
 		// Fallback for older schema if migration didn't run via init
@@ -237,7 +239,6 @@ func (s *Store) SaveConfig(cfg *config.Config) error {
 		return err
 	}
 
-	// Only save embedding parameters if they have been configured (i.e. 'qmd embed' run)
 	if cfg.EmbeddingsConfigured {
 		if err := upsert("ollama_url", cfg.OllamaURL); err != nil {
 			return err
@@ -265,12 +266,10 @@ func (s *Store) SaveConfig(cfg *config.Config) error {
 		}
 	}
 
-	// Always save the configuration state flag
 	if err := upsert("embeddings_configured", fmt.Sprintf("%v", cfg.EmbeddingsConfigured)); err != nil {
 		return err
 	}
 
-	// Overwrite collections
 	if _, err := tx.Exec("DELETE FROM collections"); err != nil {
 		return err
 	}
@@ -292,6 +291,7 @@ func (s *Store) IndexDocument(colName, path, content string) error {
 	hash := util.HashContent(content)
 	now := time.Now().Format(time.RFC3339)
 	title := util.ExtractTitle(content, path)
+	size := len(content)
 
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -305,14 +305,15 @@ func (s *Store) IndexDocument(colName, path, content string) error {
 	}
 
 	_, err = tx.Exec(`
-		INSERT INTO documents (collection, path, title, hash, modified_at, active)
-		VALUES (?, ?, ?, ?, ?, 1)
+		INSERT INTO documents (collection, path, title, hash, size, modified_at, active)
+		VALUES (?, ?, ?, ?, ?, ?, 1)
 		ON CONFLICT(collection, path) DO UPDATE SET
 			title=excluded.title,
 			hash=excluded.hash,
+			size=excluded.size,
 			modified_at=excluded.modified_at,
 			active=1
-	`, colName, path, title, hash, now)
+	`, colName, path, title, hash, size, now)
 	if err != nil {
 		return err
 	}
@@ -327,8 +328,9 @@ type SearchResult struct {
 	Snippet  string
 	Score    float64
 	Matches  []string
-	Body     string // Full content for context extraction
-	Seq      int    // Sequence number of the matching chunk (for vector search)
+	Body     string // Full content
+	Size     int    // File size in bytes
+	Seq      int    // Sequence number of the matching chunk
 }
 
 func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll bool) ([]SearchResult, error) {
@@ -336,14 +338,17 @@ func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll boo
 	cleanQuery := strings.ReplaceAll(query, "\"", "")
 	ftsQuery := fmt.Sprintf(`"%s"`, cleanQuery)
 
+	// Join with documents table to retrieve the 'size' field
 	rows, err := s.DB.Query(`
 		SELECT 
-			rowid, 
-			filepath, 
-			title, 
-			body,
-			bm25(documents_fts) as rank
-		FROM documents_fts 
+			fts.rowid, 
+			fts.filepath, 
+			fts.title, 
+			fts.body,
+			bm25(documents_fts) as rank,
+			d.size
+		FROM documents_fts fts
+		JOIN documents d ON d.id = fts.rowid
 		WHERE documents_fts MATCH ? 
 		ORDER BY rank 
 		LIMIT ?`, ftsQuery, limit)
@@ -357,9 +362,10 @@ func (s *Store) SearchFTS(query string, limit int, contextLines int, findAll boo
 		var r SearchResult
 		var body string
 
-		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &body, &r.Score); err != nil {
+		if err := rows.Scan(&r.DocID, &r.Filepath, &r.Title, &body, &r.Score, &r.Size); err != nil {
 			return nil, err
 		}
+		r.Body = body
 
 		offsets := extractOffsetsFromBody(body, query)
 		r.Matches = extractMatches(body, offsets, contextLines, findAll)
@@ -509,10 +515,6 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 		return nil, err
 	}
 
-	//  Use CTE (WITH clause) to force vector search to happen in isolation first.
-	//  We extract the seq (chunk index) from the hash_seq key.
-	//  The key format is "hash_seq". Hash is 64 chars (sha256 hex).
-	//  So the sequence number starts at index 66 (1-based SQL substr index: 1..64 is hash, 65 is '_', 66+ is seq).
 	query := `
 		WITH vec_results AS (
 			SELECT hash_seq, distance
@@ -525,6 +527,7 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 			d.collection || '/' || d.path,
 			d.title,
 			c.doc,
+			d.size,
 			cast(substr(vr.hash_seq, 66) as integer) as seq
 		FROM vec_results vr
 		JOIN documents d ON d.hash = substr(vr.hash_seq, 1, 64)
@@ -541,7 +544,7 @@ func (s *Store) SearchVec(queryVec []float32, limit int) ([]SearchResult, error)
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Body, &r.Seq); err != nil {
+		if err := rows.Scan(&r.Score, &r.Filepath, &r.Title, &r.Body, &r.Size, &r.Seq); err != nil {
 			return nil, err
 		}
 		// Convert cosine distance to similarity score
@@ -643,8 +646,6 @@ func (s *Store) GetStats() (*Stats, error) {
 	return stats, nil
 }
 
-// SearchHybrid performs both FTS and Vector search and combines them using RRF.
-// It fetches more candidates (limit * 2) from each source to ensure good intersection.
 // SearchHybrid performs both FTS and Vector search and combines them using RRF.
 // It fetches more candidates (limit * 2) from each source to ensure good intersection.
 func (s *Store) SearchHybrid(textQuery string, queryVec []float32, limit int, contextLines int) ([]SearchResult, error) {

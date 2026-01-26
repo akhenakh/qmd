@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/akhenakh/qmd/internal/util"
 )
 
 type HTTPClient struct {
@@ -44,10 +46,13 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 	if isQuery {
 		prefix = "search_query: "
 	}
+	prompt := prefix + text
+
+	util.Debug("LLM [HTTP] Embed Request. Model: %s, IsQuery: %v, TextLen: %d", c.Model, isQuery, len(text))
 
 	reqBody := EmbedRequest{
 		Model:  c.Model,
-		Prompt: prefix + text,
+		Prompt: prompt,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -58,11 +63,13 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 	// Adjust endpoint based on provider (Ollama example)
 	resp, err := c.HTTPClient.Post(c.BaseURL+"/api/embeddings", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
+		util.Debug("LLM [HTTP] Error: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		util.Debug("LLM [HTTP] API Error: %s", resp.Status)
 		return nil, fmt.Errorf("API returned status: %s", resp.Status)
 	}
 
@@ -72,9 +79,11 @@ func (c *HTTPClient) Embed(text string, isQuery bool) ([]float32, error) {
 	}
 
 	vec := result.Embedding
+	util.Debug("LLM [HTTP] Embed Response. Vector Dim: %d", len(vec))
 
 	// Handle Matryoshka Truncation
 	if c.TargetDim > 0 && len(vec) > c.TargetDim {
+		util.Debug("LLM [HTTP] Truncating vector from %d to %d", len(vec), c.TargetDim)
 		vec = vec[:c.TargetDim]
 
 		// Re-normalize after truncation

@@ -40,6 +40,9 @@ var (
 	chatURL   string
 	chatModel string
 
+	// Debug flag
+	debugMode bool
+
 	// Global instances
 	globalStore  *store.Store
 	globalConfig *config.Config
@@ -94,9 +97,6 @@ func generateEmbeddings() {
 		contentToSplit := doc.Body
 
 		// Ensure the document starts with the Title as H1.
-		// If the Title is "Project Alpha" and content doesn't start with "# Project Alpha",
-		// we prepend it. This forces the splitter to treat the Title as the root context
-		// for ALL chunks in this file.
 		titleHeader := fmt.Sprintf("# %s", doc.Title)
 		if !strings.Contains(doc.Body, titleHeader) {
 			contentToSplit = fmt.Sprintf("%s\n\n%s", titleHeader, doc.Body)
@@ -127,6 +127,16 @@ func main() {
 	var rootCmd = &cobra.Command{
 		Use: "qmd",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// Initialize Debug Logger if flag is set
+			if debugMode {
+				if err := util.InitDebugLogger("debug.log"); err != nil {
+					fmt.Printf("Failed to initialize debug log: %v\n", err)
+				} else {
+					util.Debug("=== qmd session started ===")
+					util.Debug("Command: %s %v", cmd.Name(), args)
+				}
+			}
+
 			var err error
 
 			// Open Store
@@ -153,10 +163,12 @@ func main() {
 			if globalStore != nil && globalStore.DB != nil {
 				globalStore.DB.Close()
 			}
+			util.CloseDebugLogger()
 		},
 	}
 
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./qmd.sqlite", "Path to SQLite database")
+	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug logging to debug.log")
 
 	var cmdInfo = &cobra.Command{
 		Use:   "info",
