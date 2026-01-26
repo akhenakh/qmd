@@ -32,13 +32,15 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 	buf := make([]byte, 0, 1024*1024)
 	scanner.Buffer(buf, 10*1024*1024) // Increase buffer to 10MB just in case
 
-	// Regex allows for flexible whitespace: ``` markdown path/to/file.md
-	// Matches: ```markdown file.md OR ``` markdown file.md
-	headerRegex := regexp.MustCompile("^```\\s*markdown\\s+(.+)$")
+	// Capture the fence (3 or more backticks) and the file path
+	// Group 1: Backticks
+	// Group 2: Path
+	headerRegex := regexp.MustCompile("^(`{3,})\\s*markdown\\s+(.+)$")
 
 	var (
 		currentPath    string
 		currentContent strings.Builder
+		currentFence   string // The fence used to open the current block
 		inBlock        bool
 		count          int
 	)
@@ -46,8 +48,8 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Detect Header: ```markdown path/file.md
-		if match := headerRegex.FindStringSubmatch(line); len(match) > 1 {
+		// Detect Header: ```markdown path/file.md OR ````markdown path/file.md
+		if match := headerRegex.FindStringSubmatch(line); len(match) > 2 {
 			// Save previous file if exists
 			if inBlock && currentPath != "" {
 				if err := saveDoc(s, collectionName, currentPath, currentContent.String()); err != nil {
@@ -58,16 +60,16 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 			}
 
 			// Start new file
-			currentPath = strings.TrimSpace(match[1])
+			currentFence = match[1]
+			currentPath = strings.TrimSpace(match[2])
 			currentContent.Reset()
 			inBlock = true
 			continue
 		}
 
-		// Detect Footer: ```
-		// We check if line is EXACTLY ``` or starts with ``` and has no other chars
+		// Detect Footer: Must match the opening fence exactly (e.g. ``` or ````)
 		trimLine := strings.TrimSpace(line)
-		if inBlock && trimLine == "```" {
+		if inBlock && trimLine == currentFence {
 			if currentPath != "" {
 				if err := saveDoc(s, collectionName, currentPath, currentContent.String()); err != nil {
 					fmt.Printf("Error indexing %s: %v\n", currentPath, err)
@@ -78,6 +80,7 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 			inBlock = false
 			currentPath = ""
 			currentContent.Reset()
+			currentFence = ""
 			continue
 		}
 
@@ -88,7 +91,7 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 		}
 	}
 
-	// Save last file if EOF reached without closing ```
+	// Save last file if EOF reached without closing fence
 	if inBlock && currentPath != "" {
 		if err := saveDoc(s, collectionName, currentPath, currentContent.String()); err != nil {
 			fmt.Printf("Error indexing %s: %v\n", currentPath, err)
@@ -111,7 +114,5 @@ func ProcessZstdBundle(s *store.Store, archivePath string, collectionName string
 }
 
 func saveDoc(s *store.Store, col, path, content string) error {
-	// Optional: You might want to strip the frontmatter or handle it,
-	// but Store.IndexDocument generally handles raw MD fine.
 	return s.IndexDocument(col, path, content)
 }

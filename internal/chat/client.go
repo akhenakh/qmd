@@ -12,6 +12,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+const maxTurns = 15
+
 type OllamaClient struct {
 	BaseURL  string
 	Model    string
@@ -41,7 +43,7 @@ func NewOllamaClient(url, model string, mcp *mcpserver.Server) *OllamaClient {
 		Tools:   ollamaTools,
 		Client:  &http.Client{Timeout: 300 * time.Second},
 		Messages: []Message{
-			{Role: "system", Content: "You are a helpful assistant with access to a knowledge base of markdown notes. Use 'query' for most questions. Always answer based on the retrieved context."},
+			{Role: "system", Content: "You are a helpful assistant with access to a knowledge base of markdown notes. Use 'query' for most questions. Search results include a 'full_file_returned' field; if true, the 'snippet' contains the complete file content, so do not call 'get_document' for that file. Always answer based on the retrieved context."},
 		},
 	}
 }
@@ -56,7 +58,7 @@ func (c *OllamaClient) Chat(userPrompt string) (string, []ToolExecutionLog, erro
 	var executionLogs []ToolExecutionLog
 
 	// Max turns loop
-	for i := 0; i < 5; i++ {
+	for i := 0; i < maxTurns; i++ {
 		reqBody := ChatRequest{
 			Model:    c.Model,
 			Messages: c.Messages,

@@ -32,11 +32,13 @@ type Server struct {
 
 // Internal structures for JSON responses
 type searchResultJSON struct {
-	Filepath string   `json:"filepath"`
-	Title    string   `json:"title"`
-	Score    float64  `json:"score"`
-	Snippet  string   `json:"snippet,omitempty"`
-	Matches  []string `json:"matches,omitempty"`
+	Filepath         string   `json:"filepath"`
+	Title            string   `json:"title"`
+	Score            float64  `json:"score"`
+	Size             int      `json:"size"`
+	Snippet          string   `json:"snippet,omitempty"`
+	Matches          []string `json:"matches,omitempty"`
+	FullFileReturned bool     `json:"full_file_returned,omitempty"`
 }
 
 type statusJSON struct {
@@ -123,7 +125,7 @@ func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
 
 func (s *Server) registerTools() {
 	searchTool := mcp.NewTool("search",
-		mcp.WithDescription("Full text search using BM25. Returns a JSON list of matches. Use context_lines to see surrounding text."),
+		mcp.WithDescription("Full text search using BM25. Returns a JSON list of matches. Use context_lines to see surrounding text. If 'full_file_returned' is true, 'snippet' contains the complete document content and 'get_document' is not required."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of documents to return")),
 		mcp.WithNumber("context_lines", mcp.DefaultNumber(1), mcp.Description("Number of lines to show before and after a match")),
@@ -145,16 +147,20 @@ func (s *Server) registerTools() {
 		for i, r := range results {
 			// Context Logic: Small files get full content
 			snippet := r.Snippet
+			fullFile := false
 			if r.Size < maxFullContextSize {
 				snippet = r.Body
+				fullFile = true
 			}
 
 			resp[i] = searchResultJSON{
-				Filepath: r.Filepath,
-				Title:    r.Title,
-				Score:    r.Score,
-				Snippet:  snippet,
-				Matches:  r.Matches,
+				Filepath:         r.Filepath,
+				Title:            r.Title,
+				Score:            r.Score,
+				Size:             r.Size,
+				Snippet:          snippet,
+				Matches:          r.Matches,
+				FullFileReturned: fullFile,
 			}
 		}
 
@@ -168,7 +174,7 @@ func (s *Server) registerTools() {
 
 	// Vector Search Tool
 	vsearchTool := mcp.NewTool("vsearch",
-		mcp.WithDescription("Semantic search using vector embeddings. Returns the matched text chunk. Use context_lines to include surrounding text from the document."),
+		mcp.WithDescription("Semantic search using vector embeddings. Returns the matched text chunk. If 'full_file_returned' is true, 'snippet' contains the complete document content and 'get_document' is not required."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
 		mcp.WithNumber("context_lines", mcp.DefaultNumber(0), mcp.Description("Number of lines to show before and after the matched chunk")),
@@ -200,10 +206,12 @@ func (s *Server) registerTools() {
 		resp := make([]searchResultJSON, len(results))
 		for i, r := range results {
 			var snippet string
+			fullFile := false
 
 			// Context Logic: Small files get full content
 			if r.Size < maxFullContextSize {
 				snippet = r.Body
+				fullFile = true
 			} else {
 				// Large files get specific chunk + context
 				snippet = r.Snippet // Default to beginning/summary if splitting fails
@@ -226,10 +234,12 @@ func (s *Server) registerTools() {
 			}
 
 			resp[i] = searchResultJSON{
-				Filepath: r.Filepath,
-				Title:    r.Title,
-				Score:    r.Score,
-				Snippet:  snippet,
+				Filepath:         r.Filepath,
+				Title:            r.Title,
+				Score:            r.Score,
+				Size:             r.Size,
+				Snippet:          snippet,
+				FullFileReturned: fullFile,
 			}
 		}
 
@@ -243,7 +253,7 @@ func (s *Server) registerTools() {
 
 	// Hybrid Query Tool
 	queryTool := mcp.NewTool("query",
-		mcp.WithDescription("Hybrid search using both keywords and semantic meaning (RRF). Best for most queries. Supports context_lines to see surrounding text."),
+		mcp.WithDescription("Hybrid search using both keywords and semantic meaning (RRF). Best for most queries. If 'full_file_returned' is true, 'snippet' contains the complete document content and 'get_document' is not required."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(10), mcp.Description("Max number of results")),
 		mcp.WithNumber("context_lines", mcp.DefaultNumber(1), mcp.Description("Number of lines to show before and after the match")),
@@ -280,10 +290,12 @@ func (s *Server) registerTools() {
 		resp := make([]searchResultJSON, len(results))
 		for i, r := range results {
 			var finalSnippet string
+			fullFile := false
 
 			// Context Logic: Small files get full content
 			if r.Size < maxFullContextSize {
 				finalSnippet = r.Body
+				fullFile = true
 			} else {
 				// Large files logic
 				finalSnippet = r.Snippet
@@ -311,11 +323,13 @@ func (s *Server) registerTools() {
 			}
 
 			resp[i] = searchResultJSON{
-				Filepath: r.Filepath,
-				Title:    r.Title,
-				Score:    r.Score,
-				Snippet:  finalSnippet,
-				Matches:  r.Matches,
+				Filepath:         r.Filepath,
+				Title:            r.Title,
+				Score:            r.Score,
+				Size:             r.Size,
+				Snippet:          finalSnippet,
+				Matches:          r.Matches,
+				FullFileReturned: fullFile,
 			}
 		}
 
