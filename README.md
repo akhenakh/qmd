@@ -12,6 +12,7 @@ You can generate embeddings using either an **Ollama** server or **Local Inferen
 - **Archive Support**: Index massive documentation sets directly from Zstandard compressed archives (`.zst`/`.zstd`) without decompression, compatible with [fcopy](https://github.com/akhenakh/fcopy).
 - **Smart Splitting**: Uses context-aware Markdown splitting (via LangChainGo) for better embedding quality.
 - **MCP Server**: Exposes search capabilities via the [Model Context Protocol](https://modelcontextprotocol.io), allowing AI assistants (like Claude Desktop) to search your notes.
+- **Chat**: Interactive chat interface to query your indexed notes using natural language with context-aware responses.
 - **Self-Contained**: Configuration and index are stored in a local SQLite file (`./qmd.sqlite` by default), so that you can point to different db for different purposes.
 
 ## Origin
@@ -178,6 +179,12 @@ qmd info
 
 #### `server`
 Starts the Model Context Protocol (MCP) server for integration with AI agents.
+
+#### `chat`
+Starts an interactive chat session to query your indexed notes using natural language. The chat interface uses your indexed content to provide context-aware responses.
+```bash
+qmd chat
+```
 
 ## MCP Server Integration
 
